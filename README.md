@@ -2,6 +2,8 @@
 
 # MD Reader
 
+<img src="Logo.png" alt="Muddy Reader mascot reading a Markdown book" width="360">
+
 ### A Local-First, Native Markdown Projection Engine with Stateful Hypertext Traversal
 
 **One binary. One document graph. Zero browser-tab entropy.**
