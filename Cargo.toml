@@ -1,0 +1,23 @@
+[package]
+name = "md-reader"
+version = "0.1.0"
+edition = "2024"
+description = "A minimal, portable Markdown reader for Windows"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow"] }
+egui_commonmark = { version = "0.24.0", default-features = false, features = ["load-images", "pulldown_cmark"] }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+percent-encoding = "2.3"
+pulldown-cmark = { version = "0.13.4", default-features = false }
+rfd = { version = "0.17.2", default-features = false }
+url = "2.5"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
