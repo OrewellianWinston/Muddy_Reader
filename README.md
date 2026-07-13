@@ -11,8 +11,8 @@
 [![Renderer](https://img.shields.io/badge/native%20renderer-Glow-0ea5e9)](https://github.com/grovesNL/glow)
 [![Input](https://img.shields.io/badge/input-.md%20%7C%20.markdown-2ea44f)](#supported-document-semantics)
 [![Architecture](https://img.shields.io/badge/architecture-local--first-111827)](#macro-architecture)
-[![Tests](https://img.shields.io/badge/unit%20tests-11%20defined-success)](#verification-matrix)
-[![Diagrams](https://img.shields.io/badge/Mermaid%20diagrams-25-ec4899)](#macro-architecture)
+[![Tests](https://img.shields.io/badge/unit%20tests-13%20defined-success)](#verification-matrix)
+[![Diagrams](https://img.shields.io/badge/Mermaid%20diagrams-68-ec4899)](#macro-architecture)
 [![Theme](https://img.shields.io/badge/theme-system%20adaptive-8b5cf6)](#visual-system)
 
 *A compact desktop Markdown reader documented with the seriousness of a systems paper and the diagram density of an aerospace review.*
@@ -22,18 +22,18 @@
 > [!NOTE]
 > The terminology in this README is intentionally dramatic. The implementation is deliberately small, direct, and practical. Every functional claim below is grounded in the Rust source; no imaginary throughput numbers or nanosecond benchmarks have been invented.
 
-**Implementation map:** [`src/main.rs`](src/main.rs) contains the native application, interaction model, search/outline controls, and visual system. [`src/lib.rs`](src/lib.rs) contains document loading, encoding validation, heading indexing, section search, link classification, navigation primitives, and tests.
+**Implementation map:** [`src/main.rs`](src/main.rs) is an eight-line native launcher. [`src/app.rs`](src/app.rs) owns application state and transitions. [`src/ui/components.rs`](src/ui/components.rs) and [`src/ui/theme.rs`](src/ui/theme.rs) compose the responsive interface and liquid-glass visual system. The library facade in [`src/lib.rs`](src/lib.rs) re-exports focused document, indexing, link, navigation, and lexical-analysis modules.
 
 ---
 
 ## Abstract
 
-**MD Reader** is a native desktop application for deterministic projection of UTF-8 Markdown documents into a theme-adaptive reading surface. It combines local filesystem acquisition, CommonMark rendering, relative image resolution, in-memory heading indexing, an outline sidebar, case-insensitive section search, session-local text scaling, intra-document heading traversal, local Markdown-to-Markdown navigation, scroll-coordinate restoration, drag-and-drop ingestion, native file selection, and a transactional last-in-first-out navigation history.
+**MD Reader** is a native desktop application for deterministic projection of UTF-8 Markdown documents into a theme-adaptive reading surface. It combines local filesystem acquisition, CommonMark rendering, relative image resolution, in-memory heading indexing, an outline sidebar, a log-normalized word-frequency heatmap, case-insensitive section search, session-local text scaling, intra-document heading traversal, local Markdown-to-Markdown navigation, scroll-coordinate restoration, drag-and-drop ingestion, native file selection, and a transactional last-in-first-out navigation history.
 
-We model the application as a state transition system over nine principal variables:
+We model the application as a state transition system over ten principal variables:
 
 $$
-S_t = \langle D_t, C_t, H_t, E_t, y_t, r_t, O_t, Q_t, z_t \rangle
+S_t = \langle D_t, C_t, H_t, E_t, y_t, r_t, O_t, T_t, Q_t, z_t \rangle
 $$
 
 where:
@@ -45,6 +45,7 @@ where:
 - $y_t$ is the current vertical scroll coordinate, and
 - $r_t$ is an optional one-shot scroll restoration coordinate,
 - $O_t$ is outline visibility,
+- $T_t$ is the active sidebar tab (`Outline` or `Word Heatmap`),
 - $Q_t$ is the transient search-panel state and query, and
 - $z_t$ is the session-local font scale.
 
@@ -63,6 +64,7 @@ The result is, in ordinary language, **a small and polished app that opens Markd
 - [Transactional Navigation Protocol](#transactional-navigation-protocol)
 - [Frame Execution Model](#frame-execution-model)
 - [Visual System](#visual-system)
+- [Lexical Thermodynamics and the Word-Frequency Projection Subsystem](#lexical-thermodynamics-and-the-word-frequency-projection-subsystem)
 - [Core Data Model](#core-data-model)
 - [Correctness Invariants](#correctness-invariants)
 - [Complexity and Performance Envelope](#complexity-and-performance-envelope)
@@ -120,6 +122,7 @@ The project therefore prioritizes:
 | Theme-conditioned visual projection | Uses separate light and dark `egui` styles |
 | Link-classification automaton | A function deciding anchor/local/external/inactive |
 | Section-local retrieval layer | Builds a heading index and returns matching section snippets |
+| Lexical thermodynamic observatory | Counts visible words and paints a log-scaled frequency heatmap |
 | Immediate-mode execution kernel | `eframe::App::ui` runs once per UI frame |
 
 ---
@@ -148,8 +151,10 @@ The project therefore prioritizes:
 | UTF-8 BOM support | Strips an initial UTF-8 BOM | Implemented |
 | Case-insensitive extensions | Accepts forms such as `.MD` and `.MARKDOWN` | Implemented |
 | Heading outline | Lists ATX and Setext headings, then scrolls to a selected anchor | Implemented |
+| Responsive sidebar | Side-by-side on wide windows; full-width drawer on narrow windows so the document is never squeezed into a sliver | Implemented |
 | Section search | `Ctrl+F` case-insensitive search with snippets and a 100-result display cap | Implemented |
 | Text scaling | **Aa**, `Ctrl++`, `Ctrl+-`, and `Ctrl+0` change session-local typography | Implemented |
+| Word heatmap | Sidebar tab shows total/unique counts and up to 240 frequency-colored words | Implemented |
 | Forward navigation | No forward stack is present | Not implemented |
 | Editing | Read-only viewer | Not implemented |
 
@@ -157,7 +162,7 @@ The project therefore prioritizes:
 
 ## Macro Architecture
 
-The application is split into a presentation/orchestration layer in `main.rs` and a document-domain layer in `lib.rs`.
+The application is organized around explicit responsibility boundaries: a minimal launcher, an application-state orchestrator, reusable UI components, a theme module, and small domain modules. The only polymorphic boundary is `DocumentLoader`, because filesystem access is the dependency worth substituting; the rest stays direct and concrete.
 
 ```mermaid
 flowchart LR
@@ -169,20 +174,25 @@ flowchart LR
         BACK["Back command"]
     end
 
-    subgraph APP["MdReaderApp — UI and orchestration"]
+    subgraph APP["Application orchestration — app.rs"]
         LOOP["eframe immediate-mode frame loop"]
         STATE["Application state vector"]
-        TOOLBAR["Toolbar + shortcuts"]
-        CONTENT["Document / empty-state composition"]
-        ERROR_UI["Non-destructive error surface"]
+        TRANSITIONS["Open / follow / back transitions"]
+        LOADER_PORT["DocumentLoader port"]
     end
 
-    subgraph DOMAIN["md_reader domain layer"]
-        LOAD["load_document"]
+    subgraph UI["Presentation — ui/"]
+        COMPONENTS["Toolbar / search / sidebar / reader cards"]
+        THEME["System theme + liquid-glass palette"]
+    end
+
+    subgraph DOMAIN["Focused md_reader domain modules"]
+        LOAD["document.rs"]
         DECODE["decode_markdown"]
-        CLASSIFY["classify_link"]
-        COLLECT["collect_intercepted_links"]
-        HISTORY["NavigationHistory"]
+        INDEX["index.rs — headings + search"]
+        LINKS["links.rs — destination policy"]
+        HISTORY["navigation.rs — history"]
+        WORDS["words.rs — frequency heatmap"]
     end
 
     subgraph RENDER["Rendering layer"]
@@ -204,21 +214,22 @@ flowchart LR
     LOCAL_LINK --> LOOP
     BACK --> LOOP
 
-    LOOP --> TOOLBAR
-    LOOP --> CONTENT
-    LOOP --> ERROR_UI
+    LOOP --> COMPONENTS
+    COMPONENTS --> THEME
     LOOP <--> STATE
 
     STATE --> HISTORY
-    LOOP --> LOAD
+    LOOP --> TRANSITIONS
+    TRANSITIONS --> LOADER_PORT --> LOAD
     LOAD --> FS
     LOAD --> DECODE
-    LOAD --> COLLECT
-    COLLECT --> CLASSIFY
+    LOAD --> INDEX
+    LOAD --> LINKS
+    LOAD --> WORDS
 
     STATE --> CACHE
     CACHE --> VIEWER
-    CONTENT --> VIEWER
+    COMPONENTS --> VIEWER
     VIEWER --> EGUI --> GLOW --> WINDOW
 ```
 
@@ -227,24 +238,44 @@ flowchart LR
 | Layer | Responsibility | Principal symbols |
 |---|---|---|
 | Platform | Windowing, input, native selection, filesystem access | `eframe`, `rfd`, `std::fs` |
-| Presentation | Compose toolbar, cards, reader, errors, and empty state | `MdReaderApp`, `show_*`, `paint_liquid_background` |
+| Presentation | Compose toolbar, cards, responsive drawer, reader, errors, and empty state | `ui::components`, `ui::theme` |
 | Rendering | Parse and paint CommonMark, images, anchors, and link hooks | `CommonMarkViewer`, `CommonMarkCache` |
-| Domain | Validate paths, decode bytes, classify destinations, manage history | `LoadedDocument`, `LinkKind`, `NavigationHistory` |
-| State transitions | Coordinate successful opens, local traversal, and back operations | `install_document`, `open_explicit`, `follow_local_link`, `go_back` |
+| Application | Own session state and coordinate successful opens, local traversal, back, shortcuts, and layout selection | `MdReaderApp`, `install_document`, `apply_actions` |
+| Domain | Validate paths, decode bytes, index headings, search sections, classify destinations, analyze words, manage history | `document`, `index`, `links`, `words`, `navigation` |
+
+### SOLID without a ceremonial enterprise framework
+
+| Principle | Concrete application |
+|---|---|
+| Single Responsibility | Each module has one reason to change: filesystem loading, indexing, links, history, word analysis, state orchestration, component composition, or visual styling. |
+| Open/Closed | A new `DocumentLoader` can be introduced without modifying navigation or rendering logic; sidebar content remains selected through a small enum. |
+| Liskov Substitution | Any `DocumentLoader` implementation honoring `load(&Path)` can replace `FileDocumentLoader` without changing `MdReaderApp` behavior. |
+| Interface Segregation | `DocumentLoader` exposes one operation rather than a broad repository/service interface. UI helpers receive only the state they render. |
+| Dependency Inversion | The app depends on the loader capability; `FileDocumentLoader` supplies the concrete filesystem policy at the composition root. |
+| KISS | There is one trait at an actual external boundary, no container, no event bus, no abstract widget hierarchy, and no framework built around the framework. |
 
 ### Dependency topology
 
 ```mermaid
 flowchart TB
-    MAIN["src/main.rs"] --> EFRAME["eframe / egui"]
-    MAIN --> COMMONMARK_UI["egui_commonmark"]
-    MAIN --> RFD["rfd"]
-    MAIN --> LIB["src/lib.rs — md_reader"]
+    MAIN["main.rs — composition root"] --> APP["app.rs — session state"]
+    APP --> UI["ui/components.rs"]
+    UI --> THEME["ui/theme.rs"]
+    APP --> EFRAME["eframe / egui"]
+    APP --> COMMONMARK_UI["egui_commonmark"]
+    APP --> RFD["rfd"]
+    APP --> LIB["lib.rs — public facade"]
 
-    LIB --> PULLDOWN["pulldown-cmark"]
-    LIB --> URL["url"]
-    LIB --> PERCENT["percent-encoding"]
-    LIB --> STD["std::fs / std::path"]
+    LIB --> DOCUMENT["document.rs"]
+    LIB --> INDEX["index.rs"]
+    LIB --> LINKS["links.rs"]
+    LIB --> NAV["navigation.rs"]
+    LIB --> WORDS["words.rs"]
+    LINKS --> PULLDOWN
+    WORDS --> PULLDOWN
+    DOCUMENT --> URL["url"]
+    LINKS --> PERCENT["percent-encoding"]
+    DOCUMENT --> STD["std::fs / std::path"]
 
     COMMONMARK_UI --> EFRAME
     EFRAME --> GLOW["Glow renderer"]
@@ -258,14 +289,16 @@ The live application state is represented by:
 
 ```text
 MdReaderApp {
+    loader: Box<dyn DocumentLoader>,
     document: Option<LoadedDocument>,
     markdown_cache: CommonMarkCache,
     history: NavigationHistory,
     error_message: Option<String>,
     current_scroll_offset: f32,
     restore_scroll_offset: Option<f32>,
-    show_outline: bool,
-    show_search: bool,
+    sidebar_open: bool,
+    sidebar_tab: SidebarTab,
+    search_open: bool,
     search_query: String,
     font_scale: f32,
 }
@@ -274,7 +307,7 @@ MdReaderApp {
 We define the document representation as:
 
 $$
-D = \langle p, m, X, b, I \rangle
+D = \langle p, m, X, W, b, I \rangle
 $$
 
 where:
@@ -282,6 +315,7 @@ where:
 - $p$ is the absolute document path,
 - $m$ is the decoded Markdown string,
 - $X$ is the in-memory heading index and anchor-augmented render Markdown,
+- $W$ is the visible-word frequency and heatmap state,
 - $b$ is the directory URI used as the base for relative images,
 - $I$ is the sorted, deduplicated set of intercepted link destinations.
 
@@ -750,13 +784,1937 @@ The document card width is derived from available width and clamped to a maximum
 
 Rendered images are assigned a maximum width derived from the current reading width, preventing ordinary images from expanding beyond the reading column.
 
-When Outline is enabled, a fixed-width vertical sidebar lists H1–H6 entries with level-based indentation. The document keeps the remaining horizontal space; selecting an entry requests an anchor scroll in the same viewer.
+When the sidebar is enabled, a fixed-width vertical surface exposes **Outline** and **Word Heatmap** tabs. Outline lists H1–H6 entries with level-based indentation; Word Heatmap shows the log-scaled lexical field. The document keeps the remaining horizontal space, and selecting an outline entry requests an anchor scroll in the same viewer.
 
 The Search panel appears beneath the toolbar. It searches the original Markdown case-insensitively, reports the full match count, displays at most 100 matching section snippets, and navigates to a section anchor when one exists.
 
 ### Reading controls
 
-The toolbar stays compact: **Back**, **Open**, **Outline**, **Search**, **Aa**, and the current path. Outline, Search and Aa are disabled until a document is open. Text scaling is session-local and applies to body, monospace and heading styles from `80%` through `150%`; `Ctrl+0` restores `100%`.
+The toolbar stays compact: **Back**, **Open**, **Outline**, **Search**, **Aa**, and the current path. The Outline button toggles the two-tab document sidebar; Search and Aa remain independent controls. Outline, Search and Aa are disabled until a document is open. Text scaling is session-local and applies to body, monospace and heading styles from `80%` through `150%`; `Ctrl+0` restores `100%`.
+
+---
+
+## Lexical Thermodynamics and the Word-Frequency Projection Subsystem
+
+> [!IMPORTANT]
+> This chapter documents a sidebar that counts words. It is intentionally written as though the sidebar were a national laboratory operating a sparse statistical instrument under treaty supervision.
+
+The **Word Heatmap** tab answers a question that could fit in one sentence:
+
+> Which visible words occur most often in the current Markdown document?
+
+The implementation answers that question with a deterministic parser pass, Unicode-aware normalization, an ordered frequency map, a logarithmic transfer function, and a two-column field of colored native widgets. The documentation answers the same question with linear algebra, graph theory, information theory, machine-learning counterfactuals, spectral geometry, a threat model, several diagrams, and enough notation to make the feature appear eligible for research funding.
+
+### Operational summary
+
+```mermaid
+flowchart LR
+    SOURCE["UTF-8 Markdown"] --> PARSER["pulldown-cmark events"]
+    PARSER --> VISIBLE["Text + inline code payloads"]
+    VISIBLE --> TOKENS["Unicode-aware lexical tokens"]
+    TOKENS --> COUNTS["BTreeMap frequency counts"]
+    COUNTS --> VECTOR["Count vector c"]
+    VECTOR --> LOG["log-normalized heat h"]
+    LOG --> COLOR["theme-conditioned RGB interpolation"]
+    COLOR --> GRID["Word Heatmap sidebar tab"]
+```
+
+| Stage | Actual implementation | Ceremonial description |
+|---|---|---|
+| Parse | Iterate `pulldown_cmark::Event` values | Project the source into a renderer-visible semantic manifold |
+| Select | Accept `Text` and `Code` events | Apply the observability operator to the event stream |
+| Tokenize | Split at non-alphanumeric characters except apostrophes | Construct a Unicode lexical basis |
+| Normalize | Lowercase each scalar value | Collapse case-equivalent orbits |
+| Validate | Keep tokens containing at least one alphabetic character | Reject numerically degenerate pseudo-lexemes |
+| Count | Increment a `BTreeMap<String, usize>` | Accumulate a sparse nonnegative measure |
+| Sort | Count descending, lexical order for ties | Establish a deterministic total order over the vocabulary |
+| Heat | `ln(1 + count) / ln(1 + max_count)` | Apply a concave perceptual transfer operator |
+| Render | Interpolate between cold and hot theme colors | Materialize lexical energy on the native reading surface |
+
+### User-facing contract
+
+The heatmap is not a sentiment model, topic model, spell checker, language detector, embedding model, authorship classifier, or oracle. It is a direct frequency view with intentionally transparent semantics.
+
+| Property | Behavior |
+|---|---|
+| Activation | Open the sidebar with **Outline**, then select **Word Heatmap** |
+| Source | Original Markdown parsed with `Options::all()` |
+| Counted payloads | Visible text and code payload events |
+| Excluded syntax | Markdown punctuation and link destinations |
+| Case | Unicode lowercase normalization |
+| Pure numbers | Excluded because a retained token must contain a letter |
+| Ordering | Descending count, then ascending word |
+| Full vocabulary | Retained in memory for the active document |
+| Display cap | First 240 entries |
+| Intensity | Log-normalized against the most frequent word |
+| Tooltip | Word, occurrence count, total-word share, normalized heat |
+| Persistence | None; recomputed when a document is loaded |
+| Network | None |
+| Machine learning | Absolutely none, despite later sections trying very hard |
+
+### Lexical observation operator
+
+Let the Markdown parser produce an event sequence:
+
+$$
+E = \langle e_1, e_2, \ldots, e_m \rangle
+$$
+
+Define a visibility selector $V(e)$:
+
+$$
+V(e) =
+\begin{cases}
+x, & e = Text(x) \\
+x, & e = Code(x) \\
+\epsilon, & otherwise
+\end{cases}
+$$
+
+Concatenating non-empty observations gives the lexical source stream:
+
+$$
+L = V(e_1) \Vert V(e_2) \Vert \cdots \Vert V(e_m)
+$$
+
+The notation is deliberately grander than the code:
+
+```rust
+for event in Parser::new_ext(markdown, Options::all()) {
+    if let Event::Text(text) | Event::Code(text) = event {
+        collect_words(&text, &mut counts, &mut total_words);
+    }
+}
+```
+
+```mermaid
+flowchart TD
+    EVENT["Parser event"] --> KIND{"Event kind?"}
+    KIND -- Text --> ACCEPT["Observe payload"]
+    KIND -- Code --> ACCEPT
+    KIND -- Link destination --> REJECT["Do not count"]
+    KIND -- Start / End --> REJECT
+    KIND -- Rule / Break --> REJECT
+    KIND -- HTML --> REJECT
+    ACCEPT --> TOKENIZER["Lexical tokenizer"]
+    REJECT --> NEXT["Next event"]
+    TOKENIZER --> NEXT
+```
+
+This distinction matters. In:
+
+```markdown
+[Rust](https://www.rust-lang.org/)
+```
+
+the word `rust` is visible and counted. The destination components `https`, `www`, `lang`, and `org` are not visible reader text and are not counted.
+
+### Tokenization as a finite-state machine
+
+The tokenizer maintains one mutable string buffer. Each Unicode scalar value causes one of three transitions:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Empty
+    Empty --> Building: alphabetic or numeric scalar
+    Empty --> Building: apostrophe
+    Empty --> Empty: delimiter
+    Building --> Building: alphabetic or numeric scalar
+    Building --> Building: apostrophe
+    Building --> Flush: delimiter
+    Flush --> Accepted: contains an alphabetic scalar
+    Flush --> Rejected: contains no alphabetic scalar
+    Accepted --> Empty: increment count
+    Rejected --> Empty: discard token
+```
+
+For a token candidate $s$, retention is:
+
+$$
+keep(s) = \bigvee_{x \in s} alphabetic(x)
+$$
+
+Examples:
+
+| Input fragment | Normalized tokens | Notes |
+|---|---|---|
+| `Rust rust RUST` | `rust`, `rust`, `rust` | Case orbit collapsed |
+| `reader's` | `reader's` | Interior apostrophe preserved |
+| `'quoted'` | `quoted` | Boundary apostrophes trimmed |
+| `C3PO` | `c3po` | Alphanumeric token contains letters |
+| `2026` | none | Purely numeric candidate rejected |
+| `Italy—art` | `italy`, `art` | Em dash is a delimiter |
+| `state-of-the-art` | `state`, `of`, `the`, `art` | Hyphens are delimiters |
+| `Италия ИТАЛИЯ` | `италия`, `италия` | Unicode lowercase normalization |
+
+### Vocabulary construction
+
+Suppose the accepted normalized token stream is:
+
+$$
+T = \langle t_1, t_2, \ldots, t_N \rangle
+$$
+
+and its unique vocabulary is:
+
+$$
+\Omega = \{w_1, w_2, \ldots, w_d\}
+$$
+
+Each vocabulary item defines a basis direction. The one-hot encoding of token $t_k$ is:
+
+$$
+\mathbf{e}(t_k) \in \{0,1\}^{d}
+$$
+
+with exactly one nonzero coordinate. The complete frequency vector is therefore:
+
+$$
+\mathbf{c} = \sum_{k=1}^{N} \mathbf{e}(t_k)
+$$
+
+or, coordinate-wise:
+
+$$
+c_i = \sum_{k=1}^{N} [t_k = w_i]
+$$
+
+where the bracket evaluates to one when the proposition is true and zero otherwise.
+
+This is the README's central act of linear-algebraic inflation. The Rust implementation increments an integer in a map.
+
+```mermaid
+flowchart LR
+    T1["rust"] --> E1["(1,0,0,0)"]
+    T2["reader"] --> E2["(0,1,0,0)"]
+    T3["rust"] --> E3["(1,0,0,0)"]
+    T4["markdown"] --> E4["(0,0,1,0)"]
+    T5["window"] --> E5["(0,0,0,1)"]
+    E1 --> SUM["vector sum"]
+    E2 --> SUM
+    E3 --> SUM
+    E4 --> SUM
+    E5 --> SUM
+    SUM --> C["c = (2,1,1,1)"]
+```
+
+### Sparse representation
+
+A dense vector reserves one coordinate for every vocabulary item. MD Reader instead stores only observed coordinates:
+
+```text
+Dense ceremonial vector:
+    [0, 0, 0, 7, 0, 0, 2, 0, 0, 1, ...]
+
+Actual ordered map:
+    "markdown" -> 7
+    "reader"   -> 2
+    "rust"     -> 1
+```
+
+Let $d = |\Omega|$. The dense storage cost is proportional to $d$ even before counts exist. The map stores exactly $d$ observed words because the vocabulary is created from observations; the real benefit is not avoiding unobserved dictionary words but preserving deterministic keys without inventing a language-wide coordinate system.
+
+| Representation | Memory shape | Ordering | Used? |
+|---|---|---|---|
+| Dense array over a global dictionary | $O(D)$ | dictionary-defined | No |
+| Hash map | $O(d)$ | nondeterministic without sorting | No |
+| B-tree map | $O(d)$ | lexical iteration | Yes |
+| Sparse compressed vector | $O(d)$ | coordinate-defined | No |
+| GPU tensor | excessive | device-defined | Mercifully no |
+
+### Count vector norms
+
+Several norms can be computed from $\mathbf{c}$:
+
+$$
+\|\mathbf{c}\|_1 = \sum_{i=1}^{d} c_i = N
+$$
+
+$$
+\|\mathbf{c}\|_2 = \sqrt{\sum_{i=1}^{d} c_i^2}
+$$
+
+$$
+\|\mathbf{c}\|_{\infty} = \max_i c_i = c_{max}
+$$
+
+MD Reader directly uses the $L_1$ interpretation for `total_words` and the $L_\infty$ interpretation for heat normalization. The Euclidean norm is included because a linear-algebra section without it would fail inspection.
+
+```mermaid
+flowchart TB
+    C["frequency vector c"] --> L1["L1 norm = total words N"]
+    C --> L2["L2 norm = concentration magnitude"]
+    C --> LINF["L∞ norm = maximum count"]
+    L1 --> SHARE["share pᵢ = cᵢ / N"]
+    LINF --> HEAT["heat denominator ln(1 + cmax)"]
+    L2 --> UNUSED["documented; not needed by UI"]
+```
+
+### Probability simplex projection
+
+Dividing by the total token count projects the count vector onto the probability simplex:
+
+$$
+\mathbf{p} = \frac{\mathbf{c}}{\|\mathbf{c}\|_1}
+$$
+
+with:
+
+$$
+p_i \ge 0
+$$
+
+and:
+
+$$
+\sum_{i=1}^{d} p_i = 1
+$$
+
+The UI exposes $100p_i$ in each tile's tooltip. No Bayesian interpretation is implied. A word with a share of `4.25%` simply accounts for that fraction of accepted visible tokens.
+
+### Why raw counts make bad color
+
+Natural-language frequency distributions are uneven. Function words can appear many times while most content words appear once. A linear mapping:
+
+$$
+h_i^{linear} = \frac{c_i}{c_{max}}
+$$
+
+compresses most vocabulary items near zero whenever one word dominates. For counts `[1, 2, 4, 8, 32]`, linear heat becomes approximately `[0.03, 0.06, 0.13, 0.25, 1.00]`.
+
+The implemented concave transfer function is:
+
+$$
+h_i = \frac{\ln(1 + c_i)}{\ln(1 + c_{max})}
+$$
+
+For the same counts, the heat values become approximately `[0.20, 0.31, 0.46, 0.63, 1.00]`. Rare words remain visibly distinct while the maximum still maps to one.
+
+```mermaid
+xychart-beta
+    title "Linear and logarithmic heat response"
+    x-axis "count" [1, 2, 4, 8, 16, 32]
+    y-axis "normalized heat" 0 --> 1
+    line "linear" [0.031, 0.063, 0.125, 0.250, 0.500, 1.000]
+    line "logarithmic" [0.198, 0.314, 0.460, 0.628, 0.810, 1.000]
+```
+
+> [!NOTE]
+> The `xychart-beta` diagram is documentation. The application computes the logarithm but does not embed a plotting package, scientific runtime, BLAS implementation, or small university mathematics department.
+
+### Transfer-function properties
+
+For $c_i \ge 1$ and $c_{max} \ge 1$:
+
+1. $0 < h_i \le 1$.
+2. $h_i = 1$ exactly when $c_i = c_{max}$.
+3. If $c_a < c_b$, then $h_a < h_b$.
+4. The derivative decreases as the count grows.
+5. Equal counts produce equal colors before theme transformation.
+
+The derivative of the unnormalized numerator is:
+
+$$
+\frac{d}{dc}\ln(1+c) = \frac{1}{1+c}
+$$
+
+The second derivative is negative:
+
+$$
+\frac{d^2}{dc^2}\ln(1+c) = -\frac{1}{(1+c)^2}
+$$
+
+Therefore the response is monotone and concave. In normal language: every additional repetition increases heat, but the visual reward for the thousandth repetition is smaller than the reward for the second.
+
+### Theme-conditioned color projection
+
+The scalar heat value is converted into a color by channel-wise interpolation between a cold color $\mathbf{a}$ and a hot color $\mathbf{b}$:
+
+$$
+\mathbf{q}(h) = (1-h)\mathbf{a} + h\mathbf{b}
+$$
+
+For each RGB channel $j$:
+
+$$
+q_j(h) = a_j + (b_j-a_j)h
+$$
+
+The endpoints are theme-specific:
+
+| Theme | Cold RGB | Hot RGB | Intent |
+|---|---|---|---|
+| Dark | `(43, 47, 66)` | `(116, 88, 222)` | muted graphite to violet |
+| Light | `(237, 239, 248)` | `(190, 169, 255)` | cool paper to lavender |
+
+```mermaid
+flowchart LR
+    H["heat h ∈ [0,1]"] --> THEME{"active theme"}
+    THEME -- Dark --> D0["cold (43,47,66)"]
+    THEME -- Dark --> D1["hot (116,88,222)"]
+    THEME -- Light --> L0["cold (237,239,248)"]
+    THEME -- Light --> L1["hot (190,169,255)"]
+    D0 --> MIX["channel interpolation"]
+    D1 --> MIX
+    L0 --> MIX
+    L1 --> MIX
+    MIX --> TILE["native egui tile fill"]
+```
+
+### Deterministic ordering protocol
+
+Frequency heat alone does not define a stable list because several words can share a count. The ordering relation is lexicographic over the pair:
+
+$$
+key(w_i) = (-c_i, w_i)
+$$
+
+That means:
+
+1. Greater counts appear first.
+2. Equal counts are ordered alphabetically.
+3. The same document produces the same sequence across runs.
+
+```mermaid
+flowchart TD
+    A["Compare two entries a and b"] --> COUNT{"count(a) = count(b)?"}
+    COUNT -- No --> DESC["larger count first"]
+    COUNT -- Yes --> WORD["smaller lexical word first"]
+    DESC --> ORDER["deterministic total order"]
+    WORD --> ORDER
+```
+
+Worked ordering example:
+
+| Word | Count | Primary rank | Tie rank | Final position |
+|---|---:|---:|---:|---:|
+| `reader` | 8 | 1 | 1 | 1 |
+| `rust` | 8 | 1 | 2 | 2 |
+| `document` | 3 | 2 | 1 | 3 |
+| `markdown` | 3 | 2 | 2 | 4 |
+| `window` | 1 | 3 | 1 | 5 |
+
+### Sidebar composition
+
+The existing sidebar is now a two-state surface:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Outline: toolbar Outline
+    Outline --> Closed: toolbar Outline
+    Outline --> WordHeatmap: select Word Heatmap tab
+    WordHeatmap --> Outline: select Outline tab
+    WordHeatmap --> Closed: toolbar Outline
+    Closed --> Outline: open another document resets tab
+```
+
+The sidebar layout is:
+
+```text
+┌──────────────────────────────────────┐
+│ Outline │ Word Heatmap               │
+├──────────────────────────────────────┤
+│ 1284 words · 412 unique              │
+│ visible text · logarithmic intensity │
+│ rare  ░ ▒ ▓ █  frequent             │
+│                                      │
+│ ┌────────────┐ ┌────────────┐        │
+│ │ the · 83   │ │ markdown 51│        │
+│ └────────────┘ └────────────┘        │
+│ ┌────────────┐ ┌────────────┐        │
+│ │ reader · 44│ │ document 37│        │
+│ └────────────┘ └────────────┘        │
+│                 ⋮                    │
+└──────────────────────────────────────┘
+```
+
+Each tile is a fixed-height native button used as a compact colored surface. Clicking a heat tile has no semantic effect. Hovering reveals the full word, count, share, and heat value.
+
+### Display cap and full-state distinction
+
+The analysis retains all $d$ vocabulary entries. Rendering is bounded:
+
+$$
+d_{rendered} = \min(d, 240)
+$$
+
+The cap protects the immediate-mode UI from constructing an arbitrarily large widget grid every frame. It does not alter:
+
+- total word count,
+- unique word count,
+- maximum count,
+- per-word shares,
+- heat normalization,
+- the in-memory sorted vocabulary.
+
+```mermaid
+flowchart LR
+    ALL["all d entries in WordHeatmap"] --> SORT["sorted frequency vector"]
+    SORT --> TAKE["take first min(d,240)"]
+    TAKE --> GRID["two-column widget grid"]
+    ALL --> METRICS["total + unique metrics"]
+```
+
+### Complexity envelope
+
+Let:
+
+- $n$ be the number of Unicode scalar values in visible parser payloads,
+- $N$ be the accepted token count,
+- $d$ be the number of unique words.
+
+The principal costs are:
+
+| Operation | Cost | Explanation |
+|---|---:|---|
+| Parser traversal | $O(n)$ | Each parser payload is visited |
+| Token normalization | $O(n)$ | Each scalar is classified and lowercased |
+| B-tree insertion | $O(N \log d)$ | Each token updates an ordered map |
+| Entry construction | $O(d)$ | Shares and heat values are computed once |
+| Frequency sort | $O(d \log d)$ | Count-descending output order |
+| Sidebar rendering | $O(\min(d,240))$ per frame | Bounded tile grid |
+| Analysis memory | $O(d + \sum |w_i|)$ | Stored words and statistics |
+
+The end-to-end load-time bound is:
+
+$$
+O(n + N\log d + d\log d)
+$$
+
+For ordinary prose, $N \le n$ and $d \le N$, so the implementation remains thoroughly unworthy of distributed computing.
+
+```mermaid
+flowchart TB
+    N["n visible characters"] --> TOKEN["O(n) tokenization"]
+    TOKENS["N accepted tokens"] --> MAP["O(N log d) B-tree updates"]
+    D["d unique words"] --> SORT["O(d log d) ordering"]
+    SORT --> RENDER["O(min(d,240)) per frame"]
+```
+
+### Load-time lifecycle
+
+The heatmap is computed alongside the heading index, before the `LoadedDocument` is installed:
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant A as MdReaderApp
+    participant L as load_document
+    participant P as Markdown parser
+    participant W as build_word_heatmap
+    participant S as Sidebar
+
+    U->>A: Open path
+    A->>L: load_document(path)
+    L->>L: validate extension + UTF-8
+    L->>P: build_document_index(markdown)
+    L->>W: build_word_heatmap(markdown)
+    W->>P: iterate visible events
+    P-->>W: Text / Code payloads
+    W-->>L: WordHeatmap { total, entries }
+    L-->>A: LoadedDocument
+    A->>A: install document atomically
+    U->>S: select Word Heatmap
+    S->>S: render bounded tile projection
+```
+
+Because analysis occurs before installation, a failed file load does not partially replace the active document with an empty or mismatched heatmap.
+
+### Correctness invariants of the lexical subsystem
+
+#### Lexical invariant 1 — total conservation
+
+If every accepted token increments exactly one vocabulary coordinate, then:
+
+$$
+\sum_{i=1}^{d} c_i = N
+$$
+
+The implementation increments `total_words` in the same branch that increments the map entry.
+
+#### Lexical invariant 2 — maximum heat
+
+For a non-empty document:
+
+$$
+\max_i h_i = 1
+$$
+
+The test suite explicitly verifies that the most frequent word receives heat `1.0`.
+
+#### Lexical invariant 3 — case collapse
+
+For case variants $x_1, x_2, \ldots$ whose Unicode lowercase mappings are equal:
+
+$$
+lower(x_1) = lower(x_2) \Rightarrow coordinate(x_1) = coordinate(x_2)
+$$
+
+#### Lexical invariant 4 — syntax non-observability
+
+If a string occurs only in a link destination and never in a `Text` or `Code` event, its count is zero.
+
+#### Lexical invariant 5 — deterministic tie resolution
+
+For equal counts:
+
+$$
+c_a = c_b \land a < b \Rightarrow rank(a) < rank(b)
+$$
+
+#### Lexical invariant 6 — bounded rendering
+
+The number of heat tiles in one frame never exceeds 240 even if the vocabulary is much larger.
+
+```mermaid
+flowchart LR
+    CONSERVE["Σcᵢ = N"] --> TRUST["auditable counts"]
+    MAX["max hᵢ = 1"] --> TRUST
+    CASE["case variants collapse"] --> TRUST
+    SYNTAX["destinations excluded"] --> TRUST
+    ORDER["ties deterministic"] --> TRUST
+    CAP["tiles ≤ 240"] --> RESPONSIVE["bounded frame work"]
+```
+
+### Information-theoretic quantities we could compute but do not need
+
+Once $\mathbf{p}$ exists, Shannon entropy is available:
+
+$$
+H(\mathbf{p}) = -\sum_{i=1}^{d} p_i \log_2 p_i
+$$
+
+The maximum possible entropy for a vocabulary of size $d$ is:
+
+$$
+H_{max} = \log_2 d
+$$
+
+Normalized lexical entropy would be:
+
+$$
+H_{norm} = \frac{H(\mathbf{p})}{\log_2 d}
+$$
+
+This could describe whether a document reuses a small vocabulary or distributes mass more evenly. It is not required to answer “how many times did this word occur,” so MD Reader does not display it. The intellectual ancestry of this equation is Claude Shannon's 1948 paper, [*A Mathematical Theory of Communication*](https://onlinelibrary.wiley.com/doi/10.1002/j.1538-7305.1948.tb00917.x).
+
+```mermaid
+flowchart TD
+    P["probability vector p"] --> ENTROPY["Shannon entropy H(p)"]
+    ENTROPY --> LOW["low: concentrated vocabulary"]
+    ENTROPY --> HIGH["high: distributed vocabulary"]
+    LOW --> UNUSED["not currently displayed"]
+    HIGH --> UNUSED
+```
+
+### Term weighting: the multi-document empire we refuse to build
+
+Within one document, frequency is direct:
+
+$$
+tf(w,d) = count(w,d)
+$$
+
+Across a collection of $M$ documents, inverse document frequency could be:
+
+$$
+idf(w) = \log\frac{M}{1 + df(w)}
+$$
+
+and a combined weight:
+
+$$
+tfidf(w,d) = tf(w,d) \cdot idf(w)
+$$
+
+Term weighting has a long information-retrieval history; Gerard Salton and Chris Buckley's 1988 article [*Term-Weighting Approaches in Automatic Text Retrieval*](https://doi.org/10.1016/0306-4573(88)90021-0) is an appropriate primary reference.
+
+MD Reader intentionally has no library, corpus, workspace index, or persistent document collection, so $M=1$ and document-frequency theatre would add machinery without useful discrimination.
+
+```mermaid
+flowchart LR
+    CURRENT["Current design<br/>one document"] --> TF["term frequency"]
+    CORPUS["Hypothetical corpus<br/>M documents"] --> DF["document frequency"]
+    TF --> HEAT["local heatmap"]
+    TF --> TFIDF["TF-IDF"]
+    DF --> TFIDF
+    TFIDF --> NOTNOW["not part of MD Reader"]
+```
+
+### Co-occurrence matrix counterfactual
+
+For a token window radius $r$, define a co-occurrence matrix $X \in \mathbb{N}^{d \times d}$:
+
+$$
+X_{ij} = \sum_{k=1}^{N} [t_k=w_i] \sum_{q=-r}^{r} [q \ne 0][t_{k+q}=w_j]
+$$
+
+This matrix can encode which words appear near one another. It is not needed for a frequency heatmap, but once the README has introduced a matrix, it can responsibly overreact to it.
+
+```mermaid
+flowchart LR
+    STREAM["token stream"] --> WINDOWS["sliding context windows"]
+    WINDOWS --> COOCCUR["co-occurrence matrix X"]
+    COOCCUR --> SVD["truncated SVD"]
+    COOCCUR --> GLOVE["weighted log-bilinear model"]
+    COOCCUR --> GRAPH["weighted word graph"]
+    SVD --> EMBED["semantic coordinates"]
+    GLOVE --> EMBED
+    GRAPH --> EMBED
+    EMBED --> ABSURD["wildly outside current scope"]
+```
+
+Global co-occurrence statistics underpin models such as GloVe; see Pennington, Socher, and Manning's [*GloVe: Global Vectors for Word Representation*](https://aclanthology.org/D14-1162/). MD Reader does not train embeddings while opening your grocery list.
+
+### Singular-value decomposition, because the matrix is already here
+
+If $X$ existed, a factorization could be written:
+
+$$
+X = U\Sigma V^{\top}
+$$
+
+A rank-$k$ approximation would be:
+
+$$
+X_k = U_k\Sigma_k V_k^{\top}
+$$
+
+This could reduce a high-dimensional co-occurrence structure to $k$ latent directions. The current implementation has no co-occurrence matrix and therefore performs no SVD. The equation is present solely because the feature request explicitly authorized linear algebra and the README had unused vertical space.
+
+### Cosine similarity between hypothetical documents
+
+Given two count or weighted vectors $\mathbf{x}$ and $\mathbf{y}$:
+
+$$
+cos(\mathbf{x},\mathbf{y}) = \frac{\mathbf{x}^{\top}\mathbf{y}}{\|\mathbf{x}\|_2\|\mathbf{y}\|_2}
+$$
+
+| Value | Interpretation |
+|---:|---|
+| `1` | identical direction in the selected vocabulary space |
+| near `1` | strongly similar distributions |
+| near `0` | little coordinate overlap |
+| negative | impossible for raw nonnegative counts, possible for centered embeddings |
+
+MD Reader opens one document at a time, so it has nobody to compare the active document with. This is both a limitation and a triumph of restraint.
+
+### Word-graph construction
+
+The hypothetical co-occurrence matrix can be interpreted as a graph:
+
+$$
+G = (\Omega, E, X)
+$$
+
+where words are vertices and positive co-occurrence values are weighted edges.
+
+```mermaid
+graph TD
+    MARKDOWN((markdown)) --- READER((reader))
+    MARKDOWN --- DOCUMENT((document))
+    MARKDOWN --- TABLE((table))
+    READER --- WINDOW((window))
+    READER --- DOCUMENT
+    DOCUMENT --- LINK((link))
+    DOCUMENT --- HEADING((heading))
+    HEADING --- OUTLINE((outline))
+    OUTLINE --- SEARCH((search))
+    SEARCH --- WORD((word))
+    WORD --- HEATMAP((heatmap))
+```
+
+One could then compute eigenvector centrality or PageRank-like scores. The original Google system famously used link structure and an eigenvector-style importance measure; Brin and Page's Stanford-hosted paper [*The Anatomy of a Large-Scale Hypertextual Web Search Engine*](https://infolab.stanford.edu/~backrub/google.html) provides the relevant historical context.
+
+For a word heatmap, recursive authority is unnecessary. The word `the` does not become more meaningful because it co-occurs with `markdown`.
+
+### Random-walk formulation that nobody requested
+
+Let $P$ be a row-normalized co-occurrence transition matrix. A lexical random walk would evolve as:
+
+$$
+\mathbf{r}_{t+1} = \alpha P^{\top}\mathbf{r}_t + (1-\alpha)\mathbf{u}
+$$
+
+where $\mathbf{u}$ is a restart distribution. At convergence:
+
+$$
+\mathbf{r}^{*} = \alpha P^{\top}\mathbf{r}^{*} + (1-\alpha)\mathbf{u}
+$$
+
+```mermaid
+flowchart LR
+    START["restart distribution u"] --> WALK["lexical random walk"]
+    WALK --> WORD1["markdown"]
+    WORD1 --> WORD2["reader"]
+    WORD2 --> WORD3["document"]
+    WORD3 --> BORED{"restart?"}
+    BORED -- no --> WALK
+    BORED -- yes --> START
+```
+
+This process is not implemented. The heatmap uses count, which requires neither convergence tolerance nor a philosophical model of a bored reader wandering among nouns.
+
+### Random forests: an aggressively unnecessary design review
+
+Leo Breiman defined random forests as ensembles of randomized tree predictors; the primary paper is [*Random Forests*](https://doi.org/10.1023/A:1010933404324), published in *Machine Learning* in 2001.
+
+We could fabricate a feature vector for each word:
+
+$$
+\mathbf{x}_i =
+\begin{bmatrix}
+c_i \\
+p_i \\
+|w_i| \\
+first_i/N \\
+heading_i \\
+code_i \\
+vowels_i/|w_i|
+\end{bmatrix}
+$$
+
+and train a forest to predict whether the word deserves a hot tile:
+
+$$
+\hat{y}_i = majority\{T_1(\mathbf{x}_i), T_2(\mathbf{x}_i), \ldots, T_B(\mathbf{x}_i)\}
+$$
+
+```mermaid
+flowchart TD
+    FEATURES["word feature vector"] --> B1["bootstrap sample 1"]
+    FEATURES --> B2["bootstrap sample 2"]
+    FEATURES --> B3["bootstrap sample B"]
+    B1 --> T1["tree 1"]
+    B2 --> T2["tree 2"]
+    B3 --> TB["tree B"]
+    T1 --> VOTE["majority vote"]
+    T2 --> VOTE
+    TB --> VOTE
+    VOTE --> LABEL["hot / not hot"]
+    LABEL --> PUNCHLINE["infer what count already states exactly"]
+```
+
+Example decision tree:
+
+```mermaid
+flowchart TD
+    ROOT{"count ≥ 8?"}
+    ROOT -- yes --> HOT["hot"]
+    ROOT -- no --> SHARE{"share ≥ 1%?"}
+    SHARE -- yes --> WARM["warm"]
+    SHARE -- no --> LENGTH{"length ≥ 12?"}
+    LENGTH -- yes --> MYSTERIOUS["academically interesting"]
+    LENGTH -- no --> COOL["cool"]
+```
+
+This would be methodologically indefensible for the actual task:
+
+1. The target is defined directly by count.
+2. There is no labeled training set.
+3. Model output would be less transparent than the statistic.
+4. Training would delay file opening.
+5. Reproducibility would require random-seed policy.
+6. The binary would gain dependencies and size.
+7. Users would reasonably ask why their Markdown viewer contains a classifier.
+
+The random forest is therefore documented, diagrammed, cited, and rejected.
+
+### Out-of-bag estimation for a problem with no bags
+
+For completeness, a random forest can estimate error using observations omitted from each bootstrap sample. If $B_i$ is the set of trees for which observation $i$ was out-of-bag:
+
+$$
+\hat{y}_{i,OOB} = majority\{T_b(\mathbf{x}_i): b \in B_i\}
+$$
+
+The corresponding error is:
+
+$$
+E_{OOB} = \frac{1}{d}\sum_{i=1}^{d}[\hat{y}_{i,OOB} \ne y_i]
+$$
+
+MD Reader has no labels, trees, bootstrap samples, or research supervisor, so both quantities remain exactly hypothetical.
+
+### Principal component analysis of a one-document universe
+
+If many documents existed, assemble a centered document-term matrix $A$ and covariance matrix:
+
+$$
+C = \frac{1}{M-1}A^{\top}A
+$$
+
+Principal directions would satisfy:
+
+$$
+C\mathbf{v}_k = \lambda_k\mathbf{v}_k
+$$
+
+```mermaid
+flowchart LR
+    DOCS["document-term matrix"] --> CENTER["center columns"]
+    CENTER --> COV["covariance matrix"]
+    COV --> EIGEN["eigendecomposition"]
+    EIGEN --> PC1["principal lexical axis 1"]
+    EIGEN --> PC2["principal lexical axis 2"]
+    PC1 --> MAP["document scatter plot"]
+    PC2 --> MAP
+    MAP --> NOPE["requires more than one document"]
+```
+
+With a single active document, $M=1$ makes the sample covariance denominator especially theatrical.
+
+### t-SNE, because a heatmap apparently needs a manifold
+
+High-dimensional word or document vectors could also be projected to two dimensions. Van der Maaten and Hinton introduced t-SNE for high-dimensional visualization in [*Visualizing Data using t-SNE*](https://www.jmlr.org/papers/v9/vandermaaten08a.html).
+
+The method minimizes a divergence between high-dimensional and low-dimensional neighborhood distributions:
+
+$$
+KL(P\|Q) = \sum_{i \ne j} p_{ij}\log\frac{p_{ij}}{q_{ij}}
+$$
+
+```mermaid
+flowchart LR
+    HIGH["high-dimensional word vectors"] --> AFFINITY["pairwise affinities P"]
+    LOW["random 2D initialization"] --> Q["low-dimensional affinities Q"]
+    AFFINITY --> KL["minimize KL(P || Q)"]
+    Q --> KL
+    KL --> MAP["two-dimensional constellation"]
+    MAP --> SIDEBAR["too large for a 218 px sidebar"]
+```
+
+The current heatmap has one scalar per word and a deterministic order. Applying t-SNE would replace a readable list with a stochastic star field and introduce questions about perplexity, convergence, seed stability, and why `markdown` is orbiting `therefore`.
+
+### Embedding counterfactual
+
+Word-vector methods represent vocabulary items as points in $\mathbb{R}^k$:
+
+$$
+f: \Omega \rightarrow \mathbb{R}^{k}
+$$
+
+Vector arithmetic can encode relationships in trained models. GloVe, for example, uses global co-occurrence information in a weighted log-bilinear objective. MD Reader's frequency scalar:
+
+$$
+f_{reader}(w_i) = c_i
+$$
+
+is one-dimensional and intentionally semantic-free. It tells you *how often*, not *what the word means*.
+
+### Clustering counterfactual
+
+With embeddings, $k$-means would seek centroids $\mu_j$ minimizing:
+
+$$
+J = \sum_{i=1}^{d}\min_j \|\mathbf{x}_i-\mu_j\|_2^2
+$$
+
+```mermaid
+flowchart TD
+    WORDS["embedded words"] --> INIT["initialize k centroids"]
+    INIT --> ASSIGN["assign nearest centroid"]
+    ASSIGN --> UPDATE["recompute centroids"]
+    UPDATE --> CONVERGE{"stable?"}
+    CONVERGE -- no --> ASSIGN
+    CONVERGE -- yes --> CLUSTERS["lexical clusters"]
+    CLUSTERS --> REJECTED["not useful for direct counts"]
+```
+
+No clustering is performed. The heatmap's groups are implicit count levels, and those require neither centroids nor existential debate about selecting $k$.
+
+### A miniature numerical example
+
+Consider the visible text:
+
+```text
+Markdown reader reader opens Markdown.
+Reader shows tables; Markdown shows words.
+```
+
+After tokenization and normalization:
+
+```text
+markdown, reader, reader, opens, markdown,
+reader, shows, tables, markdown, shows, words
+```
+
+The count vector in vocabulary order is:
+
+| Coordinate | Word | Count $c_i$ | Share $p_i$ | Heat $h_i$ |
+|---:|---|---:|---:|---:|
+| 1 | `markdown` | 3 | 0.273 | 1.000 |
+| 2 | `opens` | 1 | 0.091 | 0.500 |
+| 3 | `reader` | 3 | 0.273 | 1.000 |
+| 4 | `shows` | 2 | 0.182 | 0.792 |
+| 5 | `tables` | 1 | 0.091 | 0.500 |
+| 6 | `words` | 1 | 0.091 | 0.500 |
+
+The displayed order is count-descending then lexical:
+
+```text
+markdown · 3
+reader   · 3
+shows    · 2
+opens    · 1
+tables   · 1
+words    · 1
+```
+
+### Numerical stability
+
+Counts are `usize` values. The heat calculation converts counts to `f32` only after exact integer accumulation. For a non-empty map:
+
+```rust
+let heat_denominator = maximum.ln_1p();
+heat = (count as f32).ln_1p() / heat_denominator;
+```
+
+`ln_1p` computes $\ln(1+x)$ directly and behaves well near zero. In this application counts are positive integers, so ordinary `ln(1.0 + x)` would also be adequate; `ln_1p` is both explicit and pleasingly numerical.
+
+| Condition | Result |
+|---|---|
+| Empty document | empty vector; zero total; no division |
+| One unique word | maximum heat `1.0` |
+| All words occur once | every tile has heat `1.0` |
+| Dominant repeated word | dominant tile `1.0`; others compressed logarithmically |
+| Extremely large count | integer exact until conversion; visual scalar remains bounded |
+
+### Stop words and deliberate non-intervention
+
+The subsystem does not remove stop words. This is intentional.
+
+```mermaid
+flowchart TD
+    TOKEN["accepted token"] --> STOP{"on language-specific stop list?"}
+    STOP -- implementation says nothing --> COUNT["count token"]
+    STOP -. hypothetical .-> DROP["discard"]
+    DROP --> PROBLEMS["language selection + hidden policy"]
+```
+
+Removing words such as `the`, `and`, or `of` could make topic words more prominent, but it would also:
+
+- require language-specific lists,
+- mishandle mixed-language documents,
+- hide real repetition,
+- create policy questions around code and proper names,
+- make the displayed total differ from direct visible-word counting.
+
+The heatmap reports the document it receives rather than a linguistically corrected document it imagines.
+
+### Stemming and lemmatization non-policy
+
+`read`, `reader`, `reading`, and `reads` occupy separate coordinates. No stemming or lemmatization occurs.
+
+| Technique | Possible collapse | Why absent |
+|---|---|---|
+| Suffix stemming | `reading` → `read` | language-dependent and lossy |
+| Lemmatization | `was` → `be` | requires linguistic models |
+| Case folding | `Reader` → `reader` | implemented; transparent and cheap |
+| Accent folding | `café` → `cafe` | not implemented; changes spelling |
+| Synonym merging | `reader` ↔ `viewer` | semantic model required |
+
+### Privacy and trust boundary
+
+All analysis remains local:
+
+```mermaid
+flowchart LR
+    FILE["local Markdown file"] --> MEMORY["process memory"]
+    MEMORY --> PARSE["local parser"]
+    PARSE --> COUNTS["local frequency map"]
+    COUNTS --> UI["native sidebar"]
+    UI --> USER["human eyeballs"]
+    COUNTS -. no edge .-> NETWORK["remote service"]
+```
+
+No word, count, vector, matrix, imagined embedding, or rejected random forest leaves the process through this feature.
+
+### Failure model
+
+Word analysis cannot independently fail after Markdown decoding because it has no I/O and returns a value directly. It can produce an empty result for:
+
+- an empty document,
+- a document containing no `Text` or `Code` events,
+- content consisting entirely of punctuation or pure numbers,
+- pathological prose written exclusively as raw HTML events.
+
+The sidebar reports `No words found` rather than treating emptiness as an application error.
+
+### Verification matrix for lexical analysis
+
+| Test concern | Fixture behavior | Expected evidence |
+|---|---|---|
+| ASCII case | `Rust rust RUST` | one `rust` coordinate |
+| Link destination | `https://example.com/rust` | destination words absent |
+| Inline code | `` `Rust` `` | visible code token counted |
+| Pure numbers | `42 42` | no `42` coordinate |
+| Alphanumeric word | `C3PO` | `c3po` coordinate retained |
+| Unicode case | `Италия ИТАЛИЯ` | one `италия` coordinate |
+| Heat maximum | most frequent word | heat equals `1.0` |
+| Rare heat | single-occurrence word | heat in `(0,1)` when a maximum exceeds one |
+| Empty input | empty string | zero total and no entries |
+
+```mermaid
+flowchart TB
+    SUITE["word heatmap tests"] --> ASCII["ASCII case collapse"]
+    SUITE --> URL["link destination exclusion"]
+    SUITE --> CODE["inline code inclusion"]
+    SUITE --> NUMBER["pure-number rejection"]
+    SUITE --> UNICODE["Unicode lowercase"]
+    SUITE --> HEAT["log heat invariants"]
+    SUITE --> EMPTY["empty input"]
+```
+
+### Benchmarking protocol we do not claim to have run
+
+The README does not invent throughput. A responsible benchmark would vary:
+
+| Axis | Example values |
+|---|---|
+| Source bytes | 1 KiB, 10 KiB, 100 KiB, 1 MiB, 10 MiB |
+| Token count | $10^2$ through $10^7$ |
+| Vocabulary ratio | $d/N$ from `0.01` to `1.0` |
+| Script | Latin, Cyrillic, Greek, mixed Unicode |
+| Repetition | uniform, one dominant token, long-tail |
+| Markdown structure | plain paragraphs, links, tables, code-heavy |
+
+Metrics should include parse time, count time, sort time, peak allocations, and frame time with the sidebar open. Until such a benchmark exists, the project claims only algorithmic bounds and successful tests.
+
+### Alternative transfer functions considered by this README without committee approval
+
+| Name | Formula | Character | Decision |
+|---|---|---|---|
+| Linear | $c/c_{max}$ | honest but visually compressive | rejected |
+| Square root | $\sqrt{c}/\sqrt{c_{max}}$ | moderate compression | reasonable, not used |
+| Logarithmic | $\ln(1+c)/\ln(1+c_{max})$ | strong rare-word visibility | implemented |
+| Binary | $[c>0]$ | every observed word equally hot | useless |
+| Softmax | $e^{c/\tau}/\sum e^{c_j/\tau}$ | competition across words | numerically theatrical |
+| Rank | $1-rank/d$ | ignores count distance | not used |
+| Sigmoid | $(1+e^{-a(c-b)})^{-1}$ | tunable threshold | needs unexplained parameters |
+
+```mermaid
+flowchart TD
+    COUNTS["counts"] --> LINEAR["linear"]
+    COUNTS --> SQRT["square root"]
+    COUNTS --> LOG["logarithmic"]
+    COUNTS --> SOFTMAX["softmax"]
+    COUNTS --> SIGMOID["sigmoid"]
+    LOG --> CHOSEN["chosen"]
+    LINEAR --> ARCHIVE["documented alternative"]
+    SQRT --> ARCHIVE
+    SOFTMAX --> ARCHIVE
+    SIGMOID --> ARCHIVE
+```
+
+### Why not a histogram?
+
+A histogram would show how many words have each frequency, but it would hide word identity. A bar chart would preserve identity but would be difficult to fit in a narrow sidebar for hundreds of words. The tile grid uses area efficiently and supports precise values through tooltips.
+
+| Visualization | Identity | Density | Exact count | Narrow sidebar |
+|---|---:|---:|---:|---:|
+| Histogram of counts | no | high | aggregate only | good |
+| Horizontal bar chart | yes | low | yes | poor |
+| Word cloud | yes | medium | visually approximate | medium |
+| Ranked text list | yes | medium | yes | good |
+| Heat tile grid | yes | high | tooltip | good |
+
+The result is a heatmap in the practical UI sense, not a spatial matrix heatmap. Each vocabulary item is a cell; color encodes frequency intensity.
+
+### Why not a word cloud?
+
+Word clouds map frequency to font size, producing dramatic visual hierarchy but unstable reading order. Long words occupy more area, rotation can impair reading, and exact comparison is difficult. MD Reader already contains enough atmospheric background circles. The lexical panel stays aligned, sortable, and inspectable.
+
+### Why the sidebar tab is called Word Heatmap
+
+Candidate names were evaluated by a completely fictitious governance body:
+
+| Candidate | Accuracy | Drama | Rejected because |
+|---|---:|---:|---|
+| Words | high | low | insufficient ceremony |
+| Frequency | high | medium | sounds like a radio control |
+| Word counts | perfect | none | too honest |
+| Lexical field | medium | high | sounds expensive |
+| Word Heatmap | high | high | selected |
+| Semantic plasma observatory | low | extreme | reserved for version 4 |
+
+### Research citation graph
+
+The sources cited here form a conceptual graph, not an implementation dependency graph:
+
+```mermaid
+graph LR
+    SHANNON["Shannon 1948<br/>information entropy"] --> DISTRIBUTION["word probability distribution"]
+    SALTON["Salton & Buckley 1988<br/>term weighting"] --> WEIGHTS["frequency-derived weights"]
+    BREIMAN["Breiman 2001<br/>random forests"] --> REJECTED["deliberately rejected classifier"]
+    PAGE["Brin & Page 1998<br/>link eigenvectors"] --> WORDGRAPH["hypothetical word graph"]
+    GLOVE["Pennington et al. 2014<br/>global co-occurrence"] --> MATRIX["hypothetical matrix factorization"]
+    TSNE["van der Maaten & Hinton 2008<br/>2D projection"] --> STARMAP["rejected lexical constellation"]
+    DISTRIBUTION --> HEATMAP["implemented count heatmap"]
+    WEIGHTS --> HEATMAP
+    REJECTED -. not implemented .-> HEATMAP
+    WORDGRAPH -. not implemented .-> HEATMAP
+    MATRIX -. not implemented .-> HEATMAP
+    STARMAP -. not implemented .-> HEATMAP
+```
+
+### Bibliography of disproportionate intellectual ancestry
+
+1. Claude E. Shannon. “A Mathematical Theory of Communication.” *Bell System Technical Journal* 27, 1948, pp. 379–423 and 623–656. [DOI: 10.1002/j.1538-7305.1948.tb00917.x](https://onlinelibrary.wiley.com/doi/10.1002/j.1538-7305.1948.tb00917.x).
+2. Gerard Salton and Christopher Buckley. “Term-Weighting Approaches in Automatic Text Retrieval.” *Information Processing & Management* 24(5), 1988, pp. 513–523. [DOI: 10.1016/0306-4573(88)90021-0](https://doi.org/10.1016/0306-4573(88)90021-0).
+3. Lawrence Page and Sergey Brin. “The Anatomy of a Large-Scale Hypertextual Web Search Engine.” Stanford InfoLab, 1998. [Stanford-hosted paper](https://infolab.stanford.edu/~backrub/google.html).
+4. Leo Breiman. “Random Forests.” *Machine Learning* 45, 2001, pp. 5–32. [DOI: 10.1023/A:1010933404324](https://doi.org/10.1023/A:1010933404324).
+5. Laurens van der Maaten and Geoffrey Hinton. “Visualizing Data using t-SNE.” *Journal of Machine Learning Research* 9, 2008, pp. 2579–2605. [JMLR article](https://www.jmlr.org/papers/v9/vandermaaten08a.html).
+6. Jeffrey Pennington, Richard Socher, and Christopher D. Manning. “GloVe: Global Vectors for Word Representation.” *EMNLP 2014*, pp. 1532–1543. [ACL Anthology](https://aclanthology.org/D14-1162/).
+
+> [!CAUTION]
+> Citation does not imply implementation. MD Reader uses none of the cited machine-learning algorithms. The bibliography establishes conceptual context for a logarithm applied to a word count and makes the README substantially heavier than the executable feature deserves.
+
+### Decision register
+
+| Decision | Selected | Rejected alternatives | Reason |
+|---|---|---|---|
+| Count source | visible parser events | raw Markdown bytes | avoids URLs and syntax noise |
+| Token case | Unicode lowercase | case-sensitive | better aggregation |
+| Numeric policy | require a letter | count all numbers | keep the panel lexical |
+| Data structure | `BTreeMap` | `HashMap`, global dictionary | deterministic accumulation |
+| Heat scale | logarithmic | linear, rank, softmax | long-tail visibility |
+| Color system | theme-conditioned interpolation | fixed rainbow | visual consistency |
+| UI surface | sidebar tab | modal, separate window | preserves reader focus |
+| Display bound | 240 | unlimited | bounded frame work |
+| Stop words | retain | language-specific filtering | transparent semantics |
+| Stemming | none | linguistic normalization | avoid hidden transformations |
+| Random forest | citation only | actual classifier | sanity |
+| Embeddings | diagram only | bundled model | size, latency, scope |
+
+### Appendix L — Synthetic lexical-distribution atlas
+
+This appendix enumerates distributions that the heat transfer function may encounter. It exists so future maintainers can distinguish an actual defect from the inevitable visual consequences of language.
+
+#### Distribution L.1 — uniform singleton field
+
+```text
+alpha bravo charlie delta echo
+```
+
+| Word | Count | Share | Heat |
+|---|---:|---:|---:|
+| alpha | 1 | 0.20 | 1.00 |
+| bravo | 1 | 0.20 | 1.00 |
+| charlie | 1 | 0.20 | 1.00 |
+| delta | 1 | 0.20 | 1.00 |
+| echo | 1 | 0.20 | 1.00 |
+
+Every tile is maximally hot because every word is tied for the maximum. Heat is relative, not an absolute measure of repetition.
+
+#### Distribution L.2 — one repeated pair
+
+```text
+reader reader markdown window table
+```
+
+| Count | Linear heat | Log heat |
+|---:|---:|---:|
+| 1 | 0.50 | 0.63 |
+| 2 | 1.00 | 1.00 |
+
+The repeated word is hottest; singleton words remain visible.
+
+#### Distribution L.3 — dominant function word
+
+```text
+the the the the the the reader opens the document
+```
+
+| Word | Count | Rank |
+|---|---:|---:|
+| the | 7 | 1 |
+| document | 1 | 2 |
+| opens | 1 | 3 |
+| reader | 1 | 4 |
+
+No stop-word policy intervenes. The distribution reports the source faithfully.
+
+#### Distribution L.4 — case orbit
+
+```text
+Reader READER reader ReAdEr
+```
+
+The normalized stream contains four copies of `reader`; vocabulary dimension is one.
+
+$$
+\mathbf{c} = [4]
+$$
+
+$$
+\mathbf{p} = [1]
+$$
+
+$$
+\mathbf{h} = [1]
+$$
+
+#### Distribution L.5 — multilingual field
+
+```text
+Italy Italia Италия Ελλάδα art искусство τέχνη
+```
+
+The tokenizer does not select a language. Each lowercase Unicode token occupies its own coordinate.
+
+```mermaid
+graph LR
+    ITALY["italy"]
+    ITALIA["italia"]
+    ITALIA_RU["италия"]
+    GREECE["ελλάδα"]
+    ART["art"]
+    ART_RU["искусство"]
+    ART_GR["τέχνη"]
+```
+
+#### Distribution L.6 — inline code emphasis
+
+```markdown
+The `reader` opens `reader.md`; the reader remains native.
+```
+
+Inline code payloads are visible and counted. Formatting boundaries do not create separate semantic classes.
+
+#### Distribution L.7 — link-label asymmetry
+
+```markdown
+[reader](https://example.com/reader/reader)
+```
+
+| Fragment | Counted? | Reason |
+|---|---:|---|
+| `reader` label | yes | `Text` event |
+| `https` | no | destination metadata |
+| `example` | no | destination metadata |
+| destination `reader` segments | no | destination metadata |
+
+#### Distribution L.8 — numeric desert
+
+```text
+1 2 3 5 8 13 21 34
+```
+
+All candidates are purely numeric, so:
+
+$$
+N = 0, \quad d = 0
+$$
+
+The UI shows `No words found`.
+
+#### Distribution L.9 — alphanumeric survival
+
+```text
+H1 H2 mp3 C3PO UTF8 x86
+```
+
+Each token contains at least one letter and is retained. The numeric exclusion rule is not a digit exclusion rule.
+
+#### Distribution L.10 — apostrophe boundary
+
+```text
+'reader' reader's readers’ don’t
+```
+
+| Candidate | Normalized |
+|---|---|
+| `'reader'` | `reader` |
+| `reader's` | `reader's` |
+| `readers’` | `readers` |
+| `don’t` | `don’t` |
+
+Boundary apostrophes are trimmed; interior apostrophes survive.
+
+#### Distribution L.11 — hyphen decomposition
+
+```text
+state-of-the-art local-first read-only
+```
+
+Normalized tokens:
+
+```text
+state, of, the, art, local, first, read, only
+```
+
+This favors predictable delimiter behavior over language-specific compound analysis.
+
+#### Distribution L.12 — heading concentration
+
+```markdown
+# Reader Reader Reader
+
+The document opens.
+```
+
+Heading words and paragraph words belong to the same count space. The heatmap does not boost or discount heading text.
+
+#### Distribution L.13 — table repetition
+
+```markdown
+| Status | Reader |
+|---|---|
+| Ready | Reader |
+| Ready | Reader |
+```
+
+Table cell text is visible parser text and contributes normally.
+
+```mermaid
+flowchart LR
+    HEADER["Status Reader"] --> COUNTER["word counter"]
+    ROW1["Ready Reader"] --> COUNTER
+    ROW2["Ready Reader"] --> COUNTER
+    COUNTER --> READY["ready = 2"]
+    COUNTER --> READER["reader = 3"]
+```
+
+#### Distribution L.14 — long-tail staircase
+
+Counts:
+
+```text
+64, 32, 16, 8, 4, 2, 1
+```
+
+| Count | Approximate log heat |
+|---:|---:|
+| 64 | 1.000 |
+| 32 | 0.838 |
+| 16 | 0.679 |
+| 8 | 0.526 |
+| 4 | 0.386 |
+| 2 | 0.263 |
+| 1 | 0.166 |
+
+The entire staircase remains visually available.
+
+#### Distribution L.15 — vocabulary overflow
+
+If a document contains 10,000 unique words:
+
+$$
+d = 10000
+$$
+
+but:
+
+$$
+d_{rendered} = 240
+$$
+
+Statistics still describe all 10,000 entries. The UI constructs only the most frequent 240 tiles.
+
+#### Distribution L.16 — tie storm
+
+When every one of 5,000 words appears twice, all heat values equal one. Lexical order becomes the complete ranking policy.
+
+```mermaid
+flowchart TD
+    SAME["all counts = 2"] --> HEAT["all heat = 1"]
+    SAME --> TIE["frequency tie"]
+    TIE --> LEX["alphabetical ordering"]
+    LEX --> CAP["first 240 displayed"]
+```
+
+#### Distribution L.17 — one-token document
+
+```text
+markdown
+```
+
+The vector, probability, and heat spaces are each one-dimensional. No special case beyond non-empty maximum normalization is required.
+
+#### Distribution L.18 — punctuation storm
+
+```text
+!!! --- *** ::: ... ???
+```
+
+No token contains an alphabetic character. The storm is thermodynamically cold.
+
+#### Distribution L.19 — raw Markdown syntax
+
+```markdown
+***reader*** ~~reader~~ [reader](next.md)
+```
+
+The syntax characters do not appear in text events. All visible labels contribute to the same `reader` coordinate.
+
+#### Distribution L.20 — source-code vocabulary
+
+```rust
+fn reader() {
+    let reader = "markdown";
+    println!("{reader}");
+}
+```
+
+Fenced code arrives as visible text and therefore contributes identifiers and strings. The feature describes what the reader displays, not only natural-language prose.
+
+### Appendix B — Basis-vector audit ledger
+
+The following table assigns ceremonial coordinate symbols to a hypothetical 64-word vocabulary. The runtime does not materialize these symbols; this is an audit artifact for readers who demand proof that a vector can have coordinates.
+
+| Basis | Example token | Coordinate condition | Operational status |
+|---:|---|---|---|
+| $e_1$ | `algorithm` | token equals `algorithm` | illustrative |
+| $e_2$ | `anchor` | token equals `anchor` | illustrative |
+| $e_3$ | `application` | token equals `application` | illustrative |
+| $e_4$ | `art` | token equals `art` | illustrative |
+| $e_5$ | `back` | token equals `back` | illustrative |
+| $e_6$ | `binary` | token equals `binary` | illustrative |
+| $e_7$ | `cache` | token equals `cache` | illustrative |
+| $e_8$ | `color` | token equals `color` | illustrative |
+| $e_9$ | `computer` | token equals `computer` | illustrative |
+| $e_{10}$ | `count` | token equals `count` | illustrative |
+| $e_{11}$ | `document` | token equals `document` | illustrative |
+| $e_{12}$ | `drag` | token equals `drag` | illustrative |
+| $e_{13}$ | `drop` | token equals `drop` | illustrative |
+| $e_{14}$ | `error` | token equals `error` | illustrative |
+| $e_{15}$ | `event` | token equals `event` | illustrative |
+| $e_{16}$ | `file` | token equals `file` | illustrative |
+| $e_{17}$ | `font` | token equals `font` | illustrative |
+| $e_{18}$ | `forest` | token equals `forest` | illustrative but rejected |
+| $e_{19}$ | `frequency` | token equals `frequency` | illustrative |
+| $e_{20}$ | `graph` | token equals `graph` | illustrative |
+| $e_{21}$ | `heading` | token equals `heading` | illustrative |
+| $e_{22}$ | `heat` | token equals `heat` | illustrative |
+| $e_{23}$ | `heatmap` | token equals `heatmap` | illustrative |
+| $e_{24}$ | `history` | token equals `history` | illustrative |
+| $e_{25}$ | `image` | token equals `image` | illustrative |
+| $e_{26}$ | `index` | token equals `index` | illustrative |
+| $e_{27}$ | `italy` | token equals `italy` | illustrative |
+| $e_{28}$ | `layout` | token equals `layout` | illustrative |
+| $e_{29}$ | `linear` | token equals `linear` | illustrative |
+| $e_{30}$ | `link` | token equals `link` | illustrative |
+| $e_{31}$ | `local` | token equals `local` | illustrative |
+| $e_{32}$ | `logarithm` | token equals `logarithm` | illustrative |
+| $e_{33}$ | `markdown` | token equals `markdown` | illustrative |
+| $e_{34}$ | `matrix` | token equals `matrix` | illustrative |
+| $e_{35}$ | `navigation` | token equals `navigation` | illustrative |
+| $e_{36}$ | `outline` | token equals `outline` | illustrative |
+| $e_{37}$ | `parser` | token equals `parser` | illustrative |
+| $e_{38}$ | `path` | token equals `path` | illustrative |
+| $e_{39}$ | `probability` | token equals `probability` | illustrative |
+| $e_{40}$ | `projection` | token equals `projection` | illustrative |
+| $e_{41}$ | `reader` | token equals `reader` | illustrative |
+| $e_{42}$ | `render` | token equals `render` | illustrative |
+| $e_{43}$ | `rust` | token equals `rust` | illustrative |
+| $e_{44}$ | `search` | token equals `search` | illustrative |
+| $e_{45}$ | `section` | token equals `section` | illustrative |
+| $e_{46}$ | `sidebar` | token equals `sidebar` | illustrative |
+| $e_{47}$ | `state` | token equals `state` | illustrative |
+| $e_{48}$ | `table` | token equals `table` | illustrative |
+| $e_{49}$ | `text` | token equals `text` | illustrative |
+| $e_{50}$ | `theme` | token equals `theme` | illustrative |
+| $e_{51}$ | `tile` | token equals `tile` | illustrative |
+| $e_{52}$ | `token` | token equals `token` | illustrative |
+| $e_{53}$ | `toolbar` | token equals `toolbar` | illustrative |
+| $e_{54}$ | `tooltip` | token equals `tooltip` | illustrative |
+| $e_{55}$ | `tree` | token equals `tree` | illustrative but unnecessary |
+| $e_{56}$ | `unicode` | token equals `unicode` | illustrative |
+| $e_{57}$ | `vector` | token equals `vector` | illustrative |
+| $e_{58}$ | `visible` | token equals `visible` | illustrative |
+| $e_{59}$ | `window` | token equals `window` | illustrative |
+| $e_{60}$ | `word` | token equals `word` | illustrative |
+| $e_{61}$ | `workspace` | token equals `workspace` | illustrative future scope |
+| $e_{62}$ | `zoom` | token equals `zoom` | illustrative |
+| $e_{63}$ | `entropy` | token equals `entropy` | documented but unused |
+| $e_{64}$ | `eigenvector` | token equals `eigenvector` | documented with confidence |
+
+For an observed token `reader`, the one-hot vector is:
+
+$$
+\mathbf{e}(reader) = [0,\ldots,0,1,0,\ldots,0]^{\top}
+$$
+
+with the one in coordinate 41 under this fictional basis registry.
+
+### Appendix M — Matrix identity inventory
+
+The following identities are valid and mostly unnecessary.
+
+#### Identity M.1 — total count
+
+Let $\mathbf{1}$ be the all-ones vector:
+
+$$
+N = \mathbf{1}^{\top}\mathbf{c}
+$$
+
+#### Identity M.2 — maximum count
+
+$$
+c_{max} = \|\mathbf{c}\|_{\infty}
+$$
+
+#### Identity M.3 — probability vector
+
+$$
+\mathbf{p} = N^{-1}\mathbf{c}
+$$
+
+#### Identity M.4 — diagonal count operator
+
+$$
+C = diag(c_1,c_2,\ldots,c_d)
+$$
+
+#### Identity M.5 — trace recovery
+
+$$
+tr(C) = \sum_i c_i = N
+$$
+
+#### Identity M.6 — squared Euclidean concentration
+
+$$
+\mathbf{c}^{\top}\mathbf{c} = \sum_i c_i^2
+$$
+
+#### Identity M.7 — pairwise collision probability
+
+If two tokens are sampled independently from the empirical distribution:
+
+$$
+P(same) = \mathbf{p}^{\top}\mathbf{p}
+$$
+
+#### Identity M.8 — effective vocabulary size
+
+An inverse-collision measure would be:
+
+$$
+d_{effective} = \frac{1}{\mathbf{p}^{\top}\mathbf{p}}
+$$
+
+This quantity is not shown in the UI because `unique words` is easier to explain.
+
+#### Identity M.9 — heat vector
+
+Applying the scalar transfer coordinate-wise:
+
+$$
+\mathbf{h} = \frac{\ln(\mathbf{1}+\mathbf{c})}{\ln(1+c_{max})}
+$$
+
+#### Identity M.10 — rank permutation
+
+Let $\Pi$ be the permutation matrix induced by frequency order:
+
+$$
+\mathbf{c}_{sorted} = \Pi\mathbf{c}
+$$
+
+The code uses `Vec::sort_by`; no permutation matrix is allocated.
+
+#### Identity M.11 — display projection
+
+Let $R_{240}$ retain the first 240 sorted coordinates:
+
+$$
+\mathbf{h}_{ui} = R_{240}\Pi\mathbf{h}
+$$
+
+#### Identity M.12 — color affine map
+
+For RGB endpoint matrix $B=[\mathbf{a}\;\mathbf{b}]$ and coefficient vector $[1-h_i,h_i]^{\top}$:
+
+$$
+\mathbf{q}_i = B
+\begin{bmatrix}
+1-h_i \\
+h_i
+\end{bmatrix}
+$$
+
+```mermaid
+flowchart LR
+    C["count vector c"] --> PI["permutation Π"]
+    C --> LOG["coordinate log transfer"]
+    LOG --> H["heat vector h"]
+    PI --> SORTED["sorted coordinates"]
+    H --> R["display projection R240"]
+    SORTED --> R
+    R --> RGB["affine RGB map"]
+```
+
+### Appendix RF — Random-forest non-deployment charter
+
+The following controls shall apply to any future proposal to classify word heat using an ensemble of decision trees.
+
+#### RF-1 — Problem statement
+
+The proposer must explain why a deterministic count is insufficient.
+
+#### RF-2 — Label provenance
+
+Every training label must have a documented origin. “It looked hot” is not a labeling protocol.
+
+#### RF-3 — Feature necessity
+
+Features must not merely re-encode the target. A model predicting count-derived heat from count is an expensive identity function.
+
+#### RF-4 — Corpus consent
+
+Training documents must not be transmitted or persisted without an explicit user-facing design.
+
+#### RF-5 — Reproducibility
+
+Random seeds, bootstrap policy, feature subsampling, tree depth, and model version must be recorded.
+
+#### RF-6 — Binary impact
+
+Any machine-learning dependency must justify its effect on portable executable size.
+
+#### RF-7 — Latency budget
+
+Opening a Markdown file should not wait for a forest to grow.
+
+#### RF-8 — Interpretability
+
+The user must be able to understand why a tile has a given color without consulting SHAP values.
+
+#### RF-9 — Failure fallback
+
+If inference fails, direct count heat must remain available.
+
+#### RF-10 — Model retirement
+
+A removal plan must exist before the model is merged.
+
+```mermaid
+flowchart TD
+    PROPOSAL["add random forest"] --> WHY{"count insufficient?"}
+    WHY -- no --> REJECT["reject"]
+    WHY -- yes --> LABELS{"labels documented?"}
+    LABELS -- no --> REJECT
+    LABELS -- yes --> SIZE{"binary impact acceptable?"}
+    SIZE -- no --> REJECT
+    SIZE -- yes --> LATENCY{"open latency acceptable?"}
+    LATENCY -- no --> REJECT
+    LATENCY -- yes --> REVIEW["extended architectural hearing"]
+    REVIEW --> PROBABLY["probably reject anyway"]
+```
+
+### Appendix G — Graphical overinterpretation gallery
+
+#### Graph G.1 — count conservation
+
+```mermaid
+flowchart LR
+    TOKENS["accepted token stream"] --> W1["word 1 count"]
+    TOKENS --> W2["word 2 count"]
+    TOKENS --> WD["word d count"]
+    W1 --> SUM["sum"]
+    W2 --> SUM
+    WD --> SUM
+    SUM --> N["total words N"]
+```
+
+#### Graph G.2 — dual sidebar cognition
+
+```mermaid
+flowchart TB
+    SIDEBAR["document sidebar"] --> STRUCTURE["Outline tab"]
+    SIDEBAR --> LEXICON["Word Heatmap tab"]
+    STRUCTURE --> QUESTION1["Where am I?"]
+    LEXICON --> QUESTION2["What repeats?"]
+```
+
+#### Graph G.3 — observability boundary
+
+```mermaid
+flowchart LR
+    MARKDOWN["Markdown"] --> VISIBLE["visible payload"]
+    MARKDOWN --> STRUCTURE["syntax + metadata"]
+    VISIBLE --> COUNT["counted"]
+    STRUCTURE --> OMIT["not counted"]
+```
+
+#### Graph G.4 — heat semantics
+
+```mermaid
+flowchart LR
+    ONE["count 1"] --> COOL["low relative heat"]
+    FEW["count few"] --> WARM["medium heat"]
+    MAX["maximum count"] --> HOT["heat 1.0"]
+```
+
+#### Graph G.5 — deterministic data path
+
+```mermaid
+flowchart LR
+    INPUT["same input"] --> RUN1["run 1"]
+    INPUT --> RUN2["run 2"]
+    RUN1 --> RESULT1["same sorted entries"]
+    RUN2 --> RESULT2["same sorted entries"]
+    RESULT1 --> EQUAL["equal"]
+    RESULT2 --> EQUAL
+```
+
+#### Graph G.6 — machine-learning containment perimeter
+
+```mermaid
+flowchart TB
+    IMPLEMENTED["implemented"] --> COUNT["counts"]
+    IMPLEMENTED --> LOG["log heat"]
+    IMPLEMENTED --> RGB["color interpolation"]
+    HYPOTHETICAL["documented only"] --> RF["random forest"]
+    HYPOTHETICAL --> SVD["SVD"]
+    HYPOTHETICAL --> TSNE["t-SNE"]
+    HYPOTHETICAL --> PAGERANK["PageRank"]
+```
+
+#### Graph G.7 — language neutrality
+
+```mermaid
+flowchart LR
+    LATIN["Latin script"] --> UNICODE["Unicode tokenizer"]
+    CYRILLIC["Cyrillic script"] --> UNICODE
+    GREEK["Greek script"] --> UNICODE
+    MIXED["mixed document"] --> UNICODE
+    UNICODE --> COUNTS["normalized coordinates"]
+```
+
+#### Graph G.8 — empty-state logic
+
+```mermaid
+flowchart TD
+    DOC["document"] --> TEXT{"accepted words?"}
+    TEXT -- yes --> MAP["render heat grid"]
+    TEXT -- no --> EMPTY["No words found"]
+```
+
+#### Graph G.9 — visual scale governance
+
+```mermaid
+flowchart LR
+    RAW["raw count"] --> LOG["ln(1+c)"]
+    LOG --> NORMALIZE["divide by ln(1+cmax)"]
+    NORMALIZE --> CLAMP["clamp to [0,1]"]
+    CLAMP --> COLOR["RGB interpolation"]
+```
+
+#### Graph G.10 — scope gravity
+
+```mermaid
+flowchart TD
+    COUNT["count words"] --> HEAT["color words"]
+    HEAT --> MATRIX["document matrix"]
+    MATRIX --> EMBEDDING["word embeddings"]
+    EMBEDDING --> FOREST["random forest"]
+    FOREST --> GRAPH["knowledge graph"]
+    GRAPH --> PLANET["planetary lexical infrastructure"]
+    PLANET --> RESTRAINT["return to count words"]
+```
+
+### Appendix Q — Reviewer questions and formally excessive answers
+
+#### Q1. Why `BTreeMap` instead of `HashMap`?
+
+Deterministic lexical accumulation is convenient, and the final vector must be sorted by count anyway. Either structure would work. The B-tree makes intermediate key ordering stable and requires no randomized hasher state.
+
+#### Q2. Is `f32` enough for heat?
+
+Yes. The output is an 8-bit-per-channel color. Sub-pixel metaphysics beyond `f32` would not survive RGB quantization.
+
+#### Q3. Why not count raw Markdown with a regular expression?
+
+The parser already distinguishes visible labels from URLs, syntax, and structural tokens. Reusing parser semantics gives a result closer to what the user sees.
+
+#### Q4. Why count code?
+
+Code is displayed content. A code-heavy technical note may reasonably reveal repeated identifiers.
+
+#### Q5. Why exclude pure numbers?
+
+The tab is named Word Heatmap. Alphanumeric identifiers survive, but standalone numeric measurements do not dominate the lexical view.
+
+#### Q6. Why keep stop words?
+
+Transparency, multilingual behavior, and direct conservation of accepted tokens.
+
+#### Q7. Why is every singleton hot in a singleton-only document?
+
+Heat is normalized relative to the document maximum. When every count equals the maximum, every heat equals one.
+
+#### Q8. Is that confusing?
+
+Potentially. The tooltip exposes raw counts, and the summary explains that intensity is logarithmic and relative.
+
+#### Q9. Why cap at 240?
+
+The immediate-mode grid is rebuilt while visible. A cap bounds per-frame widget creation while retaining the complete analysis in memory.
+
+#### Q10. Why not virtualize the grid?
+
+It could be done later. Two hundred forty compact tiles are already sufficient for an overview.
+
+#### Q11. Does opening Word Heatmap alter the document scroll?
+
+No. It changes sidebar content only.
+
+#### Q12. Does selecting Outline again preserve the document?
+
+Yes. Both tabs inspect the same loaded document.
+
+#### Q13. Are explicit heading anchors counted?
+
+The `{#id}` syntax is parsed as heading attributes when heading scrolling is enabled and does not become visible heading text.
+
+#### Q14. Are generated anchors counted?
+
+No. Word analysis runs on the original Markdown before generated render anchors are relevant.
+
+#### Q15. Are link destinations counted?
+
+No. Only link labels appear as text events.
+
+#### Q16. Is the order locale-aware?
+
+No. Tie ordering uses Rust string ordering after Unicode lowercase normalization, not language-specific collation.
+
+#### Q17. Does the heatmap identify topics?
+
+No. Frequency can suggest repeated terms, but there is no topic inference.
+
+#### Q18. Does it support stemming?
+
+No. Morphological variants remain separate.
+
+#### Q19. Does it use random forests?
+
+No. Random forests are present only as a cited monument to possible overengineering.
+
+#### Q20. Why is the README now this long?
+
+The implementation added a map of integers. Documentation scale was permitted to vary independently.
+
+### Final reduction
+
+After the matrices, forests, manifolds, eigenvectors, graphs, divergences, and citations are removed, the feature is:
+
+```text
+parse visible text
+split into words
+lowercase them
+count them
+sort them
+take a logarithm
+paint rectangles
+```
+
+That is the complete production algorithm. Everything else in this chapter is load-bearing absurdity.
 
 ---
 
@@ -774,6 +2732,7 @@ classDiagram
         -f32 current_scroll_offset
         -Option~f32~ restore_scroll_offset
         -bool show_outline
+        -SidebarTab sidebar_tab
         -bool show_search
         -String search_query
         -f32 font_scale
@@ -789,6 +2748,7 @@ classDiagram
         +PathBuf path
         +String markdown
         +DocumentIndex index
+        +WordHeatmap word_heatmap
         +String image_base_uri
         +Vec~String~ intercepted_links
     }
@@ -804,6 +2764,18 @@ classDiagram
         +u8 level
         +String title
         +String anchor
+    }
+
+    class WordHeatmap {
+        +usize total_words
+        +Vec~WordFrequency~ entries
+    }
+
+    class WordFrequency {
+        +String word
+        +usize count
+        +f32 share
+        +f32 heat
     }
 
     class NavigationHistory {
@@ -841,6 +2813,8 @@ classDiagram
     NavigationHistory *-- NavigationEntry
     LoadedDocument *-- DocumentIndex
     DocumentIndex *-- Heading
+    LoadedDocument *-- WordHeatmap
+    WordHeatmap *-- WordFrequency
     LoadedDocument --> LinkKind : destinations classified as
     MdReaderApp --> DocumentError : displays
 ```
@@ -852,6 +2826,8 @@ classDiagram
 | `LoadedDocument` | Fully prepared, renderer-facing document payload |
 | `DocumentIndex` | In-memory headings, stable anchors, section boundaries and render Markdown |
 | `Heading` | Outline label, level and scroll target |
+| `WordHeatmap` | Total visible-word count plus a frequency-ranked lexical vector |
+| `WordFrequency` | One word's exact count, share, and log-normalized heat |
 | `DocumentError` | Human-readable load failure taxonomy |
 | `LinkKind` | Closed classification of link behavior |
 | `NavigationEntry` | Path plus preserved vertical coordinate |
@@ -1037,22 +3013,38 @@ These are prospective improvements, not current features.
 
 ## Source Topology
 
-The current two-file Rust implementation contains **1,517 lines**, including tests and whitespace.
+The current modular Rust implementation contains **1,986 lines**, including tests and whitespace.
 
 ```mermaid
 pie showData
-    title Current Rust implementation — 1,517 lines
-    "main.rs — UI, search/outline controls, rendering style" : 787
-    "lib.rs — document domain, indexing, search, tests" : 730
+    title Current Rust implementation — 1,986 lines
+    "Application orchestration" : 462
+    "Reusable UI components" : 457
+    "Heading index and search" : 340
+    "Library facade and tests" : 212
+    "Visual theme" : 169
+    "Document loading" : 117
+    "Link policy" : 105
+    "Word analysis" : 76
+    "Navigation + launcher + module declarations" : 48
 ```
 
 ### Responsibility distribution
 
 | File | Lines in current snapshot | Primary responsibility |
 |---|---:|---|
-| [`src/main.rs`](src/main.rs) | 787 | Native app lifecycle, UI, search/outline controls, rendering composition, input, visual styling |
-| [`src/lib.rs`](src/lib.rs) | 730 | Document loading, UTF-8 handling, heading indexing, section search, URI derivation, link classification, history, tests |
-| **Total** | **1,517** | Complete current implementation snapshot |
+| [`src/main.rs`](src/main.rs) | 8 | Windows subsystem attribute and composition-root launch |
+| [`src/app.rs`](src/app.rs) | 462 | Session state, state transitions, input, responsive reader composition |
+| [`src/ui/components.rs`](src/ui/components.rs) | 457 | Toolbar, search, outline, heatmap, metadata, errors, and empty state |
+| [`src/ui/theme.rs`](src/ui/theme.rs) | 169 | Light/dark tokens, typography, glass surfaces, heat palette, background painting |
+| [`src/ui/mod.rs`](src/ui/mod.rs) | 2 | UI module declarations |
+| [`src/document.rs`](src/document.rs) | 117 | Loader interface, filesystem implementation, UTF-8 validation, document assembly |
+| [`src/index.rs`](src/index.rs) | 340 | Stable heading anchors, section index, case-insensitive search snippets |
+| [`src/links.rs`](src/links.rs) | 105 | Link classification, relative-path resolution, intercepted-link discovery |
+| [`src/navigation.rs`](src/navigation.rs) | 38 | Scroll-aware LIFO history |
+| [`src/words.rs`](src/words.rs) | 76 | Visible-word tokenization and logarithmic heat normalization |
+| [`src/lib.rs`](src/lib.rs) | 212 | Public facade and 13 domain tests |
+| **Total** | **1,986** | Complete current implementation snapshot |
 
 ### Expected repository layout
 
@@ -1063,21 +3055,31 @@ pie showData
 ├── fixtures/
 │   └── markdown-showcase.md     # referenced by an integration-style unit test
 └── src/
-    ├── lib.rs                   # document and navigation domain
-    └── main.rs                  # native application and visual layer
+    ├── main.rs                  # eight-line executable entry point
+    ├── app.rs                   # session state and interaction orchestration
+    ├── lib.rs                   # public domain facade and unit tests
+    ├── document.rs              # document loading boundary
+    ├── index.rs                 # heading index and section search
+    ├── links.rs                 # local/external/inactive link policy
+    ├── navigation.rs            # Back history
+    ├── words.rs                 # lexical heatmap analysis
+    └── ui/
+        ├── mod.rs
+        ├── components.rs        # stateless or narrowly stateful widgets
+        └── theme.rs             # visual tokens and background painting
 ```
 
-> Dependency versions and feature flags are defined by the repository’s `Cargo.toml`. The test in `lib.rs` expects `fixtures/markdown-showcase.md` to exist and contain the showcase heading and a `next.md#start` link.
+> Dependency versions and feature flags are defined by the repository’s `Cargo.toml`. The tests re-exported through `lib.rs` expect `fixtures/markdown-showcase.md` to exist and contain the showcase heading and a `next.md#start` link.
 
 ---
 
 ## Verification Matrix
 
-Eleven unit tests are defined in `lib.rs`.
+Thirteen unit tests are defined in `lib.rs`.
 
 ```mermaid
 flowchart TB
-    SUITE["md_reader test suite — 11 tests"] --> PATHS["Path semantics"]
+    SUITE["md_reader test suite — 13 tests"] --> PATHS["Path semantics"]
     SUITE --> ENCODING["Encoding semantics"]
     SUITE --> LINKS["Hyperlink semantics"]
     SUITE --> HISTORY["Navigation semantics"]
@@ -1085,6 +3087,7 @@ flowchart TB
     SUITE --> FIXTURE["Fixture load integration"]
     SUITE --> INDEX["Heading-index semantics"]
     SUITE --> SEARCH["Section-search semantics"]
+    SUITE --> WORDS["Word-heatmap semantics"]
 
     PATHS --> T1["Accept .md / .MARKDOWN"]
     PATHS --> T2["Reject .txt"]
@@ -1097,6 +3100,8 @@ flowchart TB
     FIXTURE --> T9["Load bundled Markdown showcase"]
     INDEX --> T10["ATX + Setext headings, explicit IDs, fenced-code exclusion"]
     SEARCH --> T11["Section snippets, counts and no-heading fallback"]
+    WORDS --> T12["Visible text, case collapse, URL and number exclusion"]
+    WORDS --> T13["Unicode tokenization + log heat"]
 ```
 
 The graph contains more leaf assertions than test functions because several tests validate multiple related conditions.
@@ -1116,6 +3121,8 @@ The graph contains more leaf assertions than test functions because several test
 | `indexes_atx_and_setext_headings_and_preserves_explicit_ids` | Heading levels, generated anchors, explicit IDs and fenced-code exclusion |
 | `search_returns_section_snippets_and_full_match_count` | Case-insensitive counts and section-targeted snippets |
 | `search_without_headings_has_snippets_but_no_navigation_anchor` | Search behavior for documents without headings |
+| `word_heatmap_counts_visible_text_and_normalizes_case` | Visible event selection, case normalization, URL exclusion, numeric policy and maximum heat |
+| `word_heatmap_supports_unicode_and_log_scaled_intensity` | Unicode token aggregation, empty input and logarithmic heat ordering |
 
 ### Reproducibility protocol
 
@@ -1128,7 +3135,7 @@ cargo test
 cargo run -- fixtures/markdown-showcase.md
 ```
 
-A complete verification run requires the project’s `Cargo.toml`, resolvable dependencies, and the referenced fixture. The badge above intentionally says “11 defined” rather than claiming a particular CI result.
+A complete verification run requires the project’s `Cargo.toml`, resolvable dependencies, and the referenced fixture. The badge above intentionally says “13 defined” rather than claiming a particular CI result.
 
 ### Testing frontier
 
@@ -1239,7 +3246,8 @@ Clicking `Concepts` opens `concepts.md`. The current `index.md` path and scroll 
 | Reset text size | `Ctrl+0` |
 | Open file dialog | Toolbar **Open…** button |
 | Go back | Toolbar **< Back** button |
-| Toggle heading outline | Toolbar **Outline** button |
+| Toggle document sidebar | Toolbar **Outline** button |
+| Switch sidebar analysis | **Outline** / **Word Heatmap** tabs |
 | Toggle section search | Toolbar **Search** button |
 | Change text size | Toolbar **Aa** menu |
 | Open from empty state | **Open Markdown…** button |
@@ -1435,7 +3443,7 @@ The current implementation is intentionally focused. The following behaviors are
 4. **No editor.** The application is a reader, not a Markdown authoring environment.
 5. **No in-text match highlighting.** Search navigates to a containing section and lists snippets; it does not highlight every matching span in the rendered document.
 6. **No cross-document anchor restoration.** `chapter.md#section` opens the file, but the app does not explicitly scroll the newly loaded document to `#section`.
-7. **No multi-tab model.** Exactly one document is active.
+7. **No document-tab model.** The sidebar has two analysis tabs, but exactly one Markdown document is active.
 8. **No history cap.** The path-and-scroll stack can grow for the lifetime of the process.
 9. **No document cache.** Back-navigation re-reads and reparses the target file.
 10. **No root sandbox.** Explicit opens and eligible local Markdown links can access paths beyond the current directory.
@@ -1445,6 +3453,7 @@ The current implementation is intentionally focused. The following behaviors are
 14. **First-valid-drop behavior.** When multiple files are dropped, the first Markdown path is selected.
 15. **UTF-8 only.** Other encodings must be converted before opening.
 16. **Domain-heavy test coverage.** UI interactions and rendering appearance are not covered by the defined unit tests.
+17. **No linguistic normalization.** Word heat uses direct Unicode lowercase tokens without stop-word removal, stemming, lemmatization or locale-aware collation.
 
 ---
 
@@ -1454,7 +3463,7 @@ A plausible evolution path, ordered from small ergonomic gains to full knowledge
 
 ```mermaid
 flowchart LR
-    V1["Current reader<br/>open + render + outline + search + zoom"] --> V11["Forward history"]
+    V1["Current reader<br/>open + render + outline + search + zoom + word heat"] --> V11["Forward history"]
     V11 --> V12["Cross-document anchors"]
     V12 --> V13["Reload + file watching"]
     V13 --> V14["Recent files + session persistence"]
@@ -1537,7 +3546,7 @@ Exact versions and feature flags belong in `Cargo.toml`; the source imports reve
 | [`egui`](https://crates.io/crates/egui) | Immediate-mode layout, input, painting, widgets, themes |
 | [`egui_commonmark`](https://crates.io/crates/egui_commonmark) | Markdown rendering, cache, image sizing, heading scrolling, link hooks |
 | [`rfd`](https://crates.io/crates/rfd) | Native Markdown file picker |
-| [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark) | Markdown event parsing for link discovery |
+| [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark) | Markdown event parsing for link discovery and visible-word analysis |
 | [`percent-encoding`](https://crates.io/crates/percent-encoding) | Percent-decoding local link paths |
 | [`url`](https://crates.io/crates/url) | Conversion of document directories into `file:///` base URIs |
 | Rust standard library | Paths, files, errors, collections, environment arguments |
