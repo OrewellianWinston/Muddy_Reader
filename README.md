@@ -11,7 +11,7 @@
 [![Renderer](https://img.shields.io/badge/native%20renderer-Glow-0ea5e9)](https://github.com/grovesNL/glow)
 [![Input](https://img.shields.io/badge/input-.md%20%7C%20.markdown-2ea44f)](#supported-document-semantics)
 [![Architecture](https://img.shields.io/badge/architecture-local--first-111827)](#macro-architecture)
-[![Tests](https://img.shields.io/badge/unit%20tests-8%20defined-success)](#verification-matrix)
+[![Tests](https://img.shields.io/badge/unit%20tests-11%20defined-success)](#verification-matrix)
 [![Diagrams](https://img.shields.io/badge/Mermaid%20diagrams-25-ec4899)](#macro-architecture)
 [![Theme](https://img.shields.io/badge/theme-system%20adaptive-8b5cf6)](#visual-system)
 
@@ -22,18 +22,18 @@
 > [!NOTE]
 > The terminology in this README is intentionally dramatic. The implementation is deliberately small, direct, and practical. Every functional claim below is grounded in the Rust source; no imaginary throughput numbers or nanosecond benchmarks have been invented.
 
-**Implementation map:** [`src/main.rs`](src/main.rs) contains the native application, interaction model, and visual system. [`src/lib.rs`](src/lib.rs) contains document loading, encoding validation, link classification, navigation primitives, and tests.
+**Implementation map:** [`src/main.rs`](src/main.rs) contains the native application, interaction model, search/outline controls, and visual system. [`src/lib.rs`](src/lib.rs) contains document loading, encoding validation, heading indexing, section search, link classification, navigation primitives, and tests.
 
 ---
 
 ## Abstract
 
-**MD Reader** is a native desktop application for deterministic projection of UTF-8 Markdown documents into a theme-adaptive reading surface. It combines local filesystem acquisition, CommonMark rendering, relative image resolution, intra-document heading traversal, local Markdown-to-Markdown navigation, scroll-coordinate restoration, drag-and-drop ingestion, native file selection, and a transactional last-in-first-out navigation history.
+**MD Reader** is a native desktop application for deterministic projection of UTF-8 Markdown documents into a theme-adaptive reading surface. It combines local filesystem acquisition, CommonMark rendering, relative image resolution, in-memory heading indexing, an outline sidebar, case-insensitive section search, session-local text scaling, intra-document heading traversal, local Markdown-to-Markdown navigation, scroll-coordinate restoration, drag-and-drop ingestion, native file selection, and a transactional last-in-first-out navigation history.
 
-We model the application as a state transition system over six principal variables:
+We model the application as a state transition system over nine principal variables:
 
 $$
-S_t = \langle D_t, C_t, H_t, E_t, y_t, r_t \rangle
+S_t = \langle D_t, C_t, H_t, E_t, y_t, r_t, O_t, Q_t, z_t \rangle
 $$
 
 where:
@@ -43,9 +43,12 @@ where:
 - $H_t$ is the navigation history stack,
 - $E_t$ is the optional user-visible error state,
 - $y_t$ is the current vertical scroll coordinate, and
-- $r_t$ is an optional one-shot scroll restoration coordinate.
+- $r_t$ is an optional one-shot scroll restoration coordinate,
+- $O_t$ is outline visibility,
+- $Q_t$ is the transient search-panel state and query, and
+- $z_t$ is the session-local font scale.
 
-The result is, in ordinary language, **a small and polished app that opens Markdown files, renders them nicely, follows local `.md` links, and remembers where you were when you go back**.
+The result is, in ordinary language, **a small and polished app that opens Markdown files, renders them nicely, lets you browse headings and search sections, follows local `.md` links, and remembers where you were when you go back**.
 
 ---
 
@@ -116,6 +119,7 @@ The project therefore prioritizes:
 | Transactional navigation | Loads the destination before changing app state |
 | Theme-conditioned visual projection | Uses separate light and dark `egui` styles |
 | Link-classification automaton | A function deciding anchor/local/external/inactive |
+| Section-local retrieval layer | Builds a heading index and returns matching section snippets |
 | Immediate-mode execution kernel | `eframe::App::ui` runs once per UI frame |
 
 ---
@@ -143,9 +147,11 @@ The project therefore prioritizes:
 | UTF-8 validation | Rejects invalid UTF-8 content | Implemented |
 | UTF-8 BOM support | Strips an initial UTF-8 BOM | Implemented |
 | Case-insensitive extensions | Accepts forms such as `.MD` and `.MARKDOWN` | Implemented |
+| Heading outline | Lists ATX and Setext headings, then scrolls to a selected anchor | Implemented |
+| Section search | `Ctrl+F` case-insensitive search with snippets and a 100-result display cap | Implemented |
+| Text scaling | **Aa**, `Ctrl++`, `Ctrl+-`, and `Ctrl+0` change session-local typography | Implemented |
 | Forward navigation | No forward stack is present | Not implemented |
 | Editing | Read-only viewer | Not implemented |
-| Search / table of contents | No search index or TOC panel | Not implemented |
 
 ---
 
@@ -258,19 +264,24 @@ MdReaderApp {
     error_message: Option<String>,
     current_scroll_offset: f32,
     restore_scroll_offset: Option<f32>,
+    show_outline: bool,
+    show_search: bool,
+    search_query: String,
+    font_scale: f32,
 }
 ```
 
 We define the document representation as:
 
 $$
-D = \langle p, m, b, I \rangle
+D = \langle p, m, X, b, I \rangle
 $$
 
 where:
 
 - $p$ is the absolute document path,
 - $m$ is the decoded Markdown string,
+- $X$ is the in-memory heading index and anchor-augmented render Markdown,
 - $b$ is the directory URI used as the base for relative images,
 - $I$ is the sorted, deduplicated set of intercepted link destinations.
 
@@ -289,9 +300,9 @@ where $p_i$ is a previously viewed document path and $y_i$ is its last observed 
 An explicit open comes from the CLI, file picker, or drag-and-drop.
 
 $$
-\operatorname{OpenExplicit}(p):
+OpenExplicit(p):
 \begin{cases}
-D' = \operatorname{Load}(p) \\
+D' = Load(p) \\
 H' = \varnothing \\
 y' = 0 \\
 r' = 0 \\
@@ -304,10 +315,10 @@ If loading fails, only the error state changes; the currently displayed document
 #### Local-link traversal
 
 $$
-\operatorname{Follow}(p'):
+Follow(p'):
 \begin{cases}
-D' = \operatorname{Load}(p') \\
-H' = H \mathbin{\|} \langle D.p, y \rangle \\
+D' = Load(p') \\
+H' = H \Vert \langle D.p, y \rangle \\
 y' = 0 \\
 r' = 0 \\
 E' = \varnothing
@@ -321,10 +332,10 @@ The history append occurs only after `Load(p')` succeeds.
 For the last history entry $\langle p_h, y_h \rangle$:
 
 $$
-\operatorname{Back}():
+Back():
 \begin{cases}
-D' = \operatorname{Load}(p_h) \\
-H' = \operatorname{pop}(H) \\
+D' = Load(p_h) \\
+H' = pop(H) \\
 y' = y_h \\
 r' = y_h \\
 E' = \varnothing
@@ -739,6 +750,14 @@ The document card width is derived from available width and clamped to a maximum
 
 Rendered images are assigned a maximum width derived from the current reading width, preventing ordinary images from expanding beyond the reading column.
 
+When Outline is enabled, a fixed-width vertical sidebar lists H1–H6 entries with level-based indentation. The document keeps the remaining horizontal space; selecting an entry requests an anchor scroll in the same viewer.
+
+The Search panel appears beneath the toolbar. It searches the original Markdown case-insensitively, reports the full match count, displays at most 100 matching section snippets, and navigates to a section anchor when one exists.
+
+### Reading controls
+
+The toolbar stays compact: **Back**, **Open**, **Outline**, **Search**, **Aa**, and the current path. Outline, Search and Aa are disabled until a document is open. Text scaling is session-local and applies to body, monospace and heading styles from `80%` through `150%`; `Ctrl+0` restores `100%`.
+
 ---
 
 ## Core Data Model
@@ -754,6 +773,10 @@ classDiagram
         -Option~String~ error_message
         -f32 current_scroll_offset
         -Option~f32~ restore_scroll_offset
+        -bool show_outline
+        -bool show_search
+        -String search_query
+        -f32 font_scale
         +new(context, initial_path)
         +install_document(document, scroll_offset, context)
         +open_explicit(path, context)
@@ -765,8 +788,22 @@ classDiagram
     class LoadedDocument {
         +PathBuf path
         +String markdown
+        +DocumentIndex index
         +String image_base_uri
         +Vec~String~ intercepted_links
+    }
+
+    class DocumentIndex {
+        +String render_markdown
+        +Vec~Heading~ headings
+        +build_document_index(markdown)
+        +search_sections(query)
+    }
+
+    class Heading {
+        +u8 level
+        +String title
+        +String anchor
     }
 
     class NavigationHistory {
@@ -802,6 +839,8 @@ classDiagram
     MdReaderApp *-- LoadedDocument
     MdReaderApp *-- NavigationHistory
     NavigationHistory *-- NavigationEntry
+    LoadedDocument *-- DocumentIndex
+    DocumentIndex *-- Heading
     LoadedDocument --> LinkKind : destinations classified as
     MdReaderApp --> DocumentError : displays
 ```
@@ -811,6 +850,8 @@ classDiagram
 | Type | Responsibility |
 |---|---|
 | `LoadedDocument` | Fully prepared, renderer-facing document payload |
+| `DocumentIndex` | In-memory headings, stable anchors, section boundaries and render Markdown |
+| `Heading` | Outline label, level and scroll target |
 | `DocumentError` | Human-readable load failure taxonomy |
 | `LinkKind` | Closed classification of link behavior |
 | `NavigationEntry` | Path plus preserved vertical coordinate |
@@ -846,7 +887,7 @@ The implementation contains several useful invariants that are easy to miss when
 Therefore:
 
 $$
-\operatorname{Load}(p') = \operatorname{Err} \Rightarrow D' = D \land H' = H
+Load(p') = Err \Rightarrow D' = D \land H' = H
 $$
 
 Only the error message changes.
@@ -858,7 +899,7 @@ Only the error message changes.
 Therefore:
 
 $$
-\operatorname{Reload}(H_{last}.p) = \operatorname{Err} \Rightarrow H' = H
+Reload(H_{last}.p) = Err \Rightarrow H' = H
 $$
 
 The user can fix the filesystem problem and retry the same Back operation.
@@ -996,22 +1037,22 @@ These are prospective improvements, not current features.
 
 ## Source Topology
 
-The current two-file Rust implementation contains **818 lines**, including tests and whitespace.
+The current two-file Rust implementation contains **1,517 lines**, including tests and whitespace.
 
 ```mermaid
 pie showData
-    title Current Rust implementation — 818 lines
-    "main.rs — UI, orchestration, rendering style" : 493
-    "lib.rs — document domain, navigation primitives, tests" : 325
+    title Current Rust implementation — 1,517 lines
+    "main.rs — UI, search/outline controls, rendering style" : 787
+    "lib.rs — document domain, indexing, search, tests" : 730
 ```
 
 ### Responsibility distribution
 
 | File | Lines in current snapshot | Primary responsibility |
 |---|---:|---|
-| [`src/main.rs`](src/main.rs) | 493 | Native app lifecycle, UI, rendering composition, input, visual styling |
-| [`src/lib.rs`](src/lib.rs) | 325 | Document loading, UTF-8 handling, URI derivation, link classification, history, tests |
-| **Total** | **818** | Complete current implementation snapshot |
+| [`src/main.rs`](src/main.rs) | 787 | Native app lifecycle, UI, search/outline controls, rendering composition, input, visual styling |
+| [`src/lib.rs`](src/lib.rs) | 730 | Document loading, UTF-8 handling, heading indexing, section search, URI derivation, link classification, history, tests |
+| **Total** | **1,517** | Complete current implementation snapshot |
 
 ### Expected repository layout
 
@@ -1032,16 +1073,18 @@ pie showData
 
 ## Verification Matrix
 
-Eight unit tests are defined in `lib.rs`.
+Eleven unit tests are defined in `lib.rs`.
 
 ```mermaid
 flowchart TB
-    SUITE["md_reader test suite — 8 tests"] --> PATHS["Path semantics"]
+    SUITE["md_reader test suite — 11 tests"] --> PATHS["Path semantics"]
     SUITE --> ENCODING["Encoding semantics"]
     SUITE --> LINKS["Hyperlink semantics"]
     SUITE --> HISTORY["Navigation semantics"]
     SUITE --> URI["Resource-base semantics"]
     SUITE --> FIXTURE["Fixture load integration"]
+    SUITE --> INDEX["Heading-index semantics"]
+    SUITE --> SEARCH["Section-search semantics"]
 
     PATHS --> T1["Accept .md / .MARKDOWN"]
     PATHS --> T2["Reject .txt"]
@@ -1052,6 +1095,8 @@ flowchart TB
     HISTORY --> T7["LIFO push/pop behavior + scroll retention"]
     URI --> T8["Directory URI starts file:/// and ends /"]
     FIXTURE --> T9["Load bundled Markdown showcase"]
+    INDEX --> T10["ATX + Setext headings, explicit IDs, fenced-code exclusion"]
+    SEARCH --> T11["Section snippets, counts and no-heading fallback"]
 ```
 
 The graph contains more leaf assertions than test functions because several tests validate multiple related conditions.
@@ -1068,6 +1113,9 @@ The graph contains more leaf assertions than test functions because several test
 | `navigation_history_is_last_in_first_out` | Stack order and scroll-offset persistence |
 | `directory_uri_ends_with_a_separator` | File URI shape required for relative resource resolution |
 | `loads_the_bundled_markdown_fixture` | End-to-end fixture acquisition and intercepted-link extraction |
+| `indexes_atx_and_setext_headings_and_preserves_explicit_ids` | Heading levels, generated anchors, explicit IDs and fenced-code exclusion |
+| `search_returns_section_snippets_and_full_match_count` | Case-insensitive counts and section-targeted snippets |
+| `search_without_headings_has_snippets_but_no_navigation_anchor` | Search behavior for documents without headings |
 
 ### Reproducibility protocol
 
@@ -1080,7 +1128,7 @@ cargo test
 cargo run -- fixtures/markdown-showcase.md
 ```
 
-A complete verification run requires the project’s `Cargo.toml`, resolvable dependencies, and the referenced fixture. The badge above intentionally says “8 defined” rather than claiming a particular CI result.
+A complete verification run requires the project’s `Cargo.toml`, resolvable dependencies, and the referenced fixture. The badge above intentionally says “11 defined” rather than claiming a particular CI result.
 
 ### Testing frontier
 
@@ -1185,8 +1233,15 @@ Clicking `Concepts` opens `concepts.md`. The current `index.md` path and scroll 
 |---|---|
 | Open Markdown | `Ctrl+O` |
 | Go back | `Alt+Left` |
+| Open or focus section search | `Ctrl+F` |
+| Close search | `Esc` |
+| Increase / decrease text size | `Ctrl++` / `Ctrl+-` |
+| Reset text size | `Ctrl+0` |
 | Open file dialog | Toolbar **Open…** button |
 | Go back | Toolbar **< Back** button |
+| Toggle heading outline | Toolbar **Outline** button |
+| Toggle section search | Toolbar **Search** button |
+| Change text size | Toolbar **Aa** menu |
 | Open from empty state | **Open Markdown…** button |
 | Open by drag-and-drop | Drop a `.md` or `.markdown` file on the window |
 | Scroll | Mouse wheel, touchpad, or platform scroll input |
@@ -1378,7 +1433,7 @@ The current implementation is intentionally focused. The following behaviors are
 2. **No persistent session.** Open document, history, theme-resolved state, and scroll offsets are not saved across launches.
 3. **No live reload.** Changes on disk are not watched while a file remains open.
 4. **No editor.** The application is a reader, not a Markdown authoring environment.
-5. **No search or outline panel.** There is no full-text search, heading tree, or table-of-contents sidebar.
+5. **No in-text match highlighting.** Search navigates to a containing section and lists snippets; it does not highlight every matching span in the rendered document.
 6. **No cross-document anchor restoration.** `chapter.md#section` opens the file, but the app does not explicitly scroll the newly loaded document to `#section`.
 7. **No multi-tab model.** Exactly one document is active.
 8. **No history cap.** The path-and-scroll stack can grow for the lifetime of the process.
@@ -1399,12 +1454,11 @@ A plausible evolution path, ordered from small ergonomic gains to full knowledge
 
 ```mermaid
 flowchart LR
-    V1["Current core<br/>open + render + local back"] --> V11["Forward history"]
+    V1["Current reader<br/>open + render + outline + search + zoom"] --> V11["Forward history"]
     V11 --> V12["Cross-document anchors"]
     V12 --> V13["Reload + file watching"]
     V13 --> V14["Recent files + session persistence"]
-    V14 --> V2["Outline + search"]
-    V2 --> V21["Tabs / split view"]
+    V14 --> V21["Tabs / split view"]
     V21 --> V22["Document graph visualization"]
     V22 --> V23["Workspace-root policy"]
     V23 --> V3["Cached graph-scale knowledge browser"]
@@ -1421,9 +1475,8 @@ flowchart LR
 
 ### Reader ergonomics
 
-- Heading outline / table of contents.
-- Full-text search with match navigation.
-- Zoom and font-size controls.
+- In-text match highlighting and next/previous match traversal.
+- Optional persistence for text size and reader layout.
 - Copy-link and reveal-in-file-manager actions.
 - Optional line-numbered code blocks.
 - Print or export-to-PDF workflow.
@@ -1470,7 +1523,7 @@ cargo run -- fixtures/markdown-showcase.md
 - Test failed local-link and failed-back state preservation.
 - Add canonicalized workspace-root enforcement as an opt-in mode.
 - Add a file-change indicator.
-- Add a heading outline generated from the same Markdown parse.
+- Add UI-level tests for outline jumps, section-search selection and text-scale shortcuts.
 
 ---
 
