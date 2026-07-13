@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+
+# Local editor and IDE settings
+/.idea/
+/.vscode/
+*.swp
+*.swo
+
+# Windows and temporary files
+Thumbs.db
+Desktop.ini
+*.tmp
+*.bak
+
+# Local packaged binaries
+*.exe
+*.pdb
